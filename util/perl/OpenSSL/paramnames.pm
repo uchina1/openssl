@@ -1,5 +1,5 @@
 #! /usr/bin/env perl
-# Copyright 2023-2024 The OpenSSL Project Authors. All Rights Reserved.
+# Copyright 2023-2025 The OpenSSL Project Authors. All Rights Reserved.
 #
 # Licensed under the Apache License 2.0 (the "License").  You may not use
 # this file except in compliance with the License.  You can obtain a copy
@@ -14,10 +14,10 @@ use warnings;
 require Exporter;
 our @ISA = qw(Exporter);
 our @EXPORT_OK = qw(generate_public_macros
-                    generate_internal_macros
-                    produce_decoder);
+                    produce_param_decoder);
 
 my $case_sensitive = 1;
+my $need_break = 0;
 
 my %params = (
 # Well known parameter names that core passes to providers
@@ -80,6 +80,7 @@ my %params = (
     'OBJECT_PARAM_REFERENCE' =>         "reference",# OCTET_STRING
     'OBJECT_PARAM_DATA' =>              "data",# OCTET_STRING or UTF8_STRING
     'OBJECT_PARAM_DESC' =>              "desc",     # UTF8_STRING
+    'OBJECT_PARAM_INPUT_TYPE' =>        "input-type", # UTF8_STRING
 
 # Algorithm parameters
 # If "engine",or "properties",are specified, they should always be paired
@@ -93,6 +94,7 @@ my %params = (
     'ALG_PARAM_MAC' =>          "mac",          # utf8_string
     'ALG_PARAM_PROPERTIES' =>   "properties",   # utf8_string
     'ALG_PARAM_FIPS_APPROVED_INDICATOR' => 'fips-indicator',   # int, -1, 0 or 1
+    'ALG_PARAM_SECURITY_CATEGORY' => "security-category", # int, 0 .. 5
 
     # For any operation that deals with AlgorithmIdentifier, they should
     # implement both of these.
@@ -124,6 +126,7 @@ my %params = (
     'CIPHER_PARAM_NUM' =>                  "num",         # uint
     'CIPHER_PARAM_ROUNDS' =>               "rounds",      # uint
     'CIPHER_PARAM_AEAD_TAG' =>             "tag",         # octet_string
+    'CIPHER_PARAM_PIPELINE_AEAD_TAG' =>    "pipeline-tag",# octet_ptr
     'CIPHER_PARAM_AEAD_TLS1_AAD' =>        "tlsaad",      # octet_string
     'CIPHER_PARAM_AEAD_TLS1_AAD_PAD' =>    "tlsaadpad",   # size_t
     'CIPHER_PARAM_AEAD_TLS1_IV_FIXED' =>   "tlsivfixed",  # octet_string
@@ -148,6 +151,8 @@ my %params = (
     'CIPHER_PARAM_ALGORITHM_ID_PARAMS' =>  '*ALG_PARAM_ALGORITHM_ID_PARAMS',
     'CIPHER_PARAM_ALGORITHM_ID_PARAMS_OLD' => "alg_id_param", # octet_string
     'CIPHER_PARAM_XTS_STANDARD' =>         "xts_standard",# utf8_string
+    'CIPHER_PARAM_ENCRYPT_THEN_MAC' =>     "encrypt-then-mac",# int, 0 or 1
+    'CIPHER_HMAC_PARAM_MAC' =>             "*CIPHER_PARAM_AEAD_TAG",
 
     'CIPHER_PARAM_TLS1_MULTIBLOCK_MAX_SEND_FRAGMENT' =>  "tls1multi_maxsndfrag",# uint
     'CIPHER_PARAM_TLS1_MULTIBLOCK_MAX_BUFSIZE' =>        "tls1multi_maxbufsz",  # size_t
@@ -286,6 +291,7 @@ my %params = (
     'PKEY_PARAM_BITS' =>                "bits",# integer
     'PKEY_PARAM_MAX_SIZE' =>            "max-size",# integer
     'PKEY_PARAM_SECURITY_BITS' =>       "security-bits",# integer
+    'PKEY_PARAM_SECURITY_CATEGORY' =>   '*ALG_PARAM_SECURITY_CATEGORY',
     'PKEY_PARAM_DIGEST' =>              '*ALG_PARAM_DIGEST',
     'PKEY_PARAM_CIPHER' =>              '*ALG_PARAM_CIPHER', # utf8 string
     'PKEY_PARAM_ENGINE' =>              '*ALG_PARAM_ENGINE', # utf8 string
@@ -302,11 +308,16 @@ my %params = (
     'PKEY_PARAM_DIST_ID' =>             "distid",
     'PKEY_PARAM_PUB_KEY' =>             "pub",
     'PKEY_PARAM_PRIV_KEY' =>            "priv",
+    # PKEY_PARAM_IMPLICIT_REJECTION isn't actually used, or meaningful.  We keep
+    # it for API stability, but please use ASYM_CIPHER_PARAM_IMPLICIT_REJECTION
+    # instead.
     'PKEY_PARAM_IMPLICIT_REJECTION' =>  "implicit-rejection",
     'PKEY_PARAM_FIPS_DIGEST_CHECK' =>   "digest-check",
     'PKEY_PARAM_FIPS_KEY_CHECK' =>      "key-check",
     'PKEY_PARAM_ALGORITHM_ID' =>        '*ALG_PARAM_ALGORITHM_ID',
     'PKEY_PARAM_ALGORITHM_ID_PARAMS' => '*ALG_PARAM_ALGORITHM_ID_PARAMS',
+    'PKEY_PARAM_CMS_RI_TYPE' =>         "ri-type", # integer
+    'PKEY_PARAM_CMS_KEMRI_KDF_ALGORITHM' => "kemri-kdf-alg",
 
 # Diffie-Hellman/DSA Parameters
     'PKEY_PARAM_FFC_P' =>               "p",
@@ -413,6 +424,14 @@ my %params = (
 # EC, X25519 and X448 Key generation parameters
     'PKEY_PARAM_DHKEM_IKM' =>        "dhkem-ikm",
 
+# ML-KEM parameters
+    'PKEY_PARAM_ML_KEM_SEED' => "seed",
+    'PKEY_PARAM_ML_KEM_PREFER_SEED' => "ml-kem.prefer_seed",
+    'PKEY_PARAM_ML_KEM_RETAIN_SEED' => "ml-kem.retain_seed",
+    'PKEY_PARAM_ML_KEM_INPUT_FORMATS' => "ml-kem.input_formats",
+    'PKEY_PARAM_ML_KEM_OUTPUT_FORMATS' => "ml-kem.output_formats",
+    'PKEY_PARAM_ML_KEM_IMPORT_PCT_TYPE' => "ml-kem.import_pct_type",
+
 # Key generation parameters
     'PKEY_PARAM_FFC_TYPE' =>         "type",
     'PKEY_PARAM_FFC_PBITS' =>        "pbits",
@@ -426,6 +445,16 @@ my %params = (
     'PKEY_PARAM_EC_INCLUDE_PUBLIC' =>          "include-public",
     'PKEY_PARAM_FIPS_SIGN_CHECK' =>            "sign-check",
     'PKEY_PARAM_FIPS_APPROVED_INDICATOR' => '*ALG_PARAM_FIPS_APPROVED_INDICATOR',
+
+# ML_DSA Key generation parameter
+    'PKEY_PARAM_ML_DSA_SEED' =>             "seed",
+    'PKEY_PARAM_ML_DSA_RETAIN_SEED' =>      "ml-dsa.retain_seed",
+    'PKEY_PARAM_ML_DSA_PREFER_SEED' =>      "ml-dsa.prefer_seed",
+    'PKEY_PARAM_ML_DSA_INPUT_FORMATS' =>    "ml-dsa.input_formats",
+    'PKEY_PARAM_ML_DSA_OUTPUT_FORMATS' =>   "ml-dsa.output_formats",
+
+# SLH_DSA Key generation parameters
+    'PKEY_PARAM_SLH_DSA_SEED' =>              "seed",
 
 # Key Exchange parameters
     'EXCHANGE_PARAM_PAD' =>                   "pad",# uint
@@ -462,6 +491,11 @@ my %params = (
     'SIGNATURE_PARAM_FIPS_SIGN_X931_PAD_CHECK' => "sign-x931-pad-check",
     'SIGNATURE_PARAM_FIPS_APPROVED_INDICATOR' => '*ALG_PARAM_FIPS_APPROVED_INDICATOR',
     'SIGNATURE_PARAM_SIGNATURE' =>          "signature",
+    'SIGNATURE_PARAM_MESSAGE_ENCODING' =>   "message-encoding",
+    'SIGNATURE_PARAM_DETERMINISTIC' =>      "deterministic",
+    'SIGNATURE_PARAM_MU' =>                 "mu", # int
+    'SIGNATURE_PARAM_TEST_ENTROPY' =>       "test-entropy",
+    'SIGNATURE_PARAM_ADD_RANDOM' =>         "additional-random",
 
 # Asym cipher parameters
     'ASYM_CIPHER_PARAM_DIGEST' =>                   '*PKEY_PARAM_DIGEST',
@@ -545,6 +579,8 @@ my %params = (
     'CAPABILITY_TLS_SIGALG_SECURITY_BITS' =>     "tls-sigalg-sec-bits",
     'CAPABILITY_TLS_SIGALG_MIN_TLS' =>           "tls-min-tls",
     'CAPABILITY_TLS_SIGALG_MAX_TLS' =>           "tls-max-tls",
+    'CAPABILITY_TLS_SIGALG_MIN_DTLS' =>          "tls-min-dtls",
+    'CAPABILITY_TLS_SIGALG_MAX_DTLS' =>          "tls-max-dtls",
 
 # storemgmt parameters
 
@@ -587,7 +623,38 @@ my %params = (
     'LIBSSL_RECORD_LAYER_PARAM_MAX_EARLY_DATA' => "max_early_data",
     'LIBSSL_RECORD_LAYER_PARAM_BLOCK_PADDING' =>  "block_padding",
     'LIBSSL_RECORD_LAYER_PARAM_HS_PADDING' =>     "hs_padding",
+
+# Symmetric Key parametes
+    'SKEY_PARAM_RAW_BYTES' => "raw-bytes",
+    'SKEY_PARAM_KEY_LENGTH' => "key-length",
 );
+
+sub output_ifdef {
+    my $cond = shift;
+
+    if (defined($cond)) {
+        print "# if" . $cond . "\n";
+    }
+}
+
+sub output_else {
+    my $cond = shift;
+    my $body = shift;
+
+    if (defined($cond)) {
+        print "# else\n";
+        print($body);
+    }
+}
+
+sub output_endifdef {
+    my $cond = shift;
+
+    if (defined($cond)) {
+        print "# endif\n";
+        $need_break = 1;
+    }
+}
 
 # Generate string based macros for public consumption
 sub generate_public_macros {
@@ -607,101 +674,80 @@ sub generate_public_macros {
     return join("\n", sort @macros);
 }
 
-# Generate number based macros for internal use
-# The numbers are unique per string
-sub generate_internal_macros {
-    my @macros = ();
-    my $count = 0;
-    my %reverse;
+sub trie_matched {
+  my $field = shift;
+  my $num = shift;
+  my $indent1 = shift;
+  my $indent2 = shift;
 
-    # Determine the number for each unique string
-    # Sort the names to improve the chance of cache coherency
-    foreach my $name (sort keys %params) {
-        my $val = $params{$name};
-
-        if (substr($val, 0, 1) ne '*' and not defined $reverse{$val}) {
-            $reverse{$val} = $count++;
-        }
-    }
-
-    # Output the defines
-    foreach my $name (keys %params) {
-        my $val = $params{$name};
-        my $def = '#define PIDX_' . $name . ' ';
-
-        if (substr($val, 0, 1) eq '*') {
-            $def .= 'PIDX_' . substr($val, 1);
-        } else {
-            $def .= $reverse{$val};
-        }
-        push(@macros, $def)
-    }
-    return "#define NUM_PIDX $count\n\n" . join("\n", sort @macros);
+  if (defined($num)) {
+    printf "%sif (ossl_unlikely(r->num_%s >= %s)) {\n", $indent1, $field, $num;
+    printf "%sERR_raise_data(ERR_LIB_PROV, PROV_R_TOO_MANY_RECORDS,\n", $indent2;
+    printf "%s               \"param %%s present >%%d times\", s, $num);\n", $indent2;
+    printf "%sreturn 0;\n", $indent2;
+    printf "%s}\n", $indent1;
+    printf "%sr->%s[r->num_%s++] = (OSSL_PARAM *)p;\n", $indent1, $field, $field;
+  } else {
+    printf "%sif (ossl_unlikely(r->%s != NULL)) {\n", $indent1, $field;
+    printf "%sERR_raise_data(ERR_LIB_PROV, PROV_R_REPEATED_PARAMETER,\n", $indent2;
+    printf "%s               \"param %%s is repeated\", s);\n", $indent2;
+    printf "%sreturn 0;\n", $indent2;
+    printf "%s}\n", $indent1;
+    printf "%sr->%s = (OSSL_PARAM *)p;\n", $indent1, $field;
+  }
 }
 
-sub generate_trie {
-    my %trie;
-    my $nodes = 0;
-    my $chars = 0;
-
-    foreach my $name (sort keys %params) {
-        my $val = $params{$name};
-        if (substr($val, 0, 1) ne '*') {
-            my $cursor = \%trie;
-
-            $chars += length($val);
-            for my $i (0 .. length($val) - 1) {
-                my $c = substr($val, $i, 1);
-
-                if (not $case_sensitive) {
-                    $c = '_' if $c eq '-';
-                    $c = lc $c;
-                }
-
-                if (not defined $$cursor{$c}) {
-                    $cursor->{$c} = {};
-                    $nodes++;
-                }
-                $cursor = $cursor->{$c};
-            }
-            $cursor->{'val'} = $name;
-        }
-    }
-    #print "\n\n/* $nodes nodes for $chars letters*/\n\n";
-    return %trie;
-}
-
-sub generate_code_from_trie {
+sub generate_decoder_from_trie {
     my $n = shift;
     my $trieref = shift;
+    my $identmap = shift;
+    my $concat_num = shift;
+    my $ifdefs = shift;
     my $idt = "    ";
-    my $indent0 = $idt x ($n + 1);
+    my $indent0 = $idt x ($n + 3);
     my $indent1 = $indent0 . $idt;
+    my $indent2 = $indent1 . $idt;
     my $strcmp = $case_sensitive ? 'strcmp' : 'strcasecmp';
-
-    print "int ossl_param_find_pidx(const char *s)\n{\n" if $n == 0;
+    my $field;
 
     if ($trieref->{'suffix'}) {
         my $suf = $trieref->{'suffix'};
 
-        printf "%sif ($strcmp(\"$suf\", s + $n) == 0", $indent0;
+        $field = $identmap->{$trieref->{'name'}};
+        my $num = $concat_num->{$field};
+        output_ifdef($ifdefs->{$field});
+        printf "%sif (ossl_likely($strcmp(\"$suf\", s + $n) == 0", $indent0;
         if (not $case_sensitive) {
             $suf =~ tr/_/-/;
             print " || $strcmp(\"$suf\", s + $n) == 0"
                 if ($suf ne $trieref->{'suffix'});
         }
-        printf ")\n%sreturn PIDX_%s;\n", $indent1, $trieref->{'name'};
-        #printf "%sbreak;\n", $indent0;
+        print ")) {\n";
+        printf "%s/* %s */\n", $indent1, $trieref->{'name'};
+        trie_matched($field, $num, $indent1, $indent2);
+        printf "%s}\n", $indent0;
+
+        # If this is at the top level and it's conditional, we have to
+        # insert an empty statement in an else branch to avoid badness.
+        # This isn't a problem at any other level since those are always
+        # followed by a break statement.
+        output_else($ifdefs->{$field}, $indent0 . ";\n") if ($n == 0);
+        output_endifdef($ifdefs->{$field});
         return;
     }
 
     printf "%sswitch(s\[%d\]) {\n", $indent0, $n;
     printf "%sdefault:\n", $indent0;
     for my $l (sort keys %$trieref) {
+        $need_break = 0;
         if ($l eq 'val') {
+            $field = $identmap->{$trieref->{'val'}};
+            my $num = $concat_num->{$field};
             printf "%sbreak;\n", $indent1;
             printf "%scase '\\0':\n", $indent0;
-            printf "%sreturn PIDX_%s;\n", $indent1, $trieref->{'val'};
+            output_ifdef($ifdefs->{$field});
+            trie_matched($field, $num, $indent1, $indent2);
+            output_endifdef($ifdefs->{$field});
         } else {
             printf "%sbreak;\n", $indent1;
             printf "%scase '%s':", $indent0, $l;
@@ -710,12 +756,50 @@ sub generate_code_from_trie {
                 printf "   case '%s':", uc $l if ($l =~ /[a-z]/);
             }
             print "\n";
-            generate_code_from_trie($n + 1, $trieref->{$l});
+            generate_decoder_from_trie($n + 1, $trieref->{$l}, $identmap, $concat_num, $ifdefs);
         }
     }
+    if ($need_break) {
+        printf "%sbreak;\n", $indent1;
+    }
     printf "%s}\n", $indent0;
-    print "    return -1;\n}\n" if $n == 0;
-    return "";
+    return;
+}
+
+sub generate_trie {
+    my @keys = @_;
+    my %trie;
+    my $nodes = 0;
+    my $chars = 0;
+
+    foreach my $name (sort @keys) {
+        my $val = $params{$name};
+        die("Unknown parameter name '$name'\n") if !defined $val;
+        while (substr($val, 0, 1) eq '*') {
+            $val = $params{substr($val, 1)};
+            die("Unknown referenced parameter from '$name'\n")
+                if !defined $val;
+        }
+        my $cursor = \%trie;
+
+        $chars += length($val);
+        for my $i (0 .. length($val) - 1) {
+            my $c = substr($val, $i, 1);
+
+            if (not $case_sensitive) {
+                $c = '_' if $c eq '-';
+                $c = lc $c;
+            }
+
+            if (not defined $$cursor{$c}) {
+                $cursor->{$c} = {};
+                $nodes++;
+            }
+            $cursor = $cursor->{$c};
+        }
+        $cursor->{'val'} = $name;
+    }
+    return %trie;
 }
 
 # Find long endings and cache what they resolve to
@@ -744,13 +828,97 @@ sub locate_long_endings {
     return 0, '';
 }
 
-sub produce_decoder {
-    my %t = generate_trie();
-    my $s;
+sub output_param_decoder {
+    my $decoder_name_base = shift;
+    my @params = @_;
+    my @keys = ();
+    my %prms = ();
+    my %concat_num = ();
+    my %ifdefs = ();
 
+    print "/* Machine generated by util/perl/OpenSSL/paramnames.pm */\n";
+    # Output ettable param array
+    printf "#ifndef %s_list\n", $decoder_name_base;
+    printf "static const OSSL_PARAM %s_list[] = {\n", $decoder_name_base;
+    for (my $i = 0; $i <= $#params; $i++) {
+        my $pname = $params[$i][0];
+        my $pident = $params[$i][1];
+        my $ptype = $params[$i][2];
+        my $pnum = $params[$i][3];
+
+        $prms{$pname} = $pident;
+
+        if (defined $pnum) {
+            if ($pnum eq 'hidden') {
+                next;
+            } elsif ($pnum eq 'fips') {
+                # The `#if' is added on output
+                $ifdefs{$pident} = ' defined(FIPS_MODULE)';
+            } elsif ($pnum eq '!fips') {
+                $ifdefs{$pident} = ' !defined(FIPS_MODULE)';
+            } elsif (substr($pnum, 0, 3) eq '#if') {
+                # Trim the `#if' from the front
+                $ifdefs{$pident} = substr($pnum, 3);
+            } elsif (not defined $concat_num{$pident}) {
+                $concat_num{$pident} = $pnum;
+            }
+        }
+        output_ifdef($ifdefs{$pident});
+        print "    OSSL_PARAM_$ptype(OSSL_$pname, NULL";
+        print ", 0" if $ptype eq "octet_string" || $ptype eq "octet_ptr"
+                       || $ptype eq "utf8_string" || $ptype eq "utf8_ptr"
+                       || $ptype eq "BN";
+        printf "),\n";
+        output_endifdef($ifdefs{$pident});
+    }
+    print "    OSSL_PARAM_END\n};\n#endif\n\n";
+
+    # Output param pointer structure
+    printf "#ifndef %s_st\n", $decoder_name_base;
+    printf "struct %s_st {\n", $decoder_name_base;
+    my %done_prms = ();
+    foreach my $pident (sort values %prms) {
+        if (not defined $done_prms{$pident}) {
+            $done_prms{$pident} = 1;
+            output_ifdef($ifdefs{$pident});
+            if (defined($concat_num{$pident})) {
+                printf "    OSSL_PARAM *%s[%s];\n", $pident, $concat_num{$pident};
+                printf "    int num_%s;\n", $pident;
+            } else {
+                printf "    OSSL_PARAM *%s;\n", $pident;
+            }
+
+            # If this is the only field and it's conditional, we have to
+            # insert a dummy field to avoid an empty struct
+            output_else($ifdefs{$pident}, "    int dummy; /* unused */\n")
+                if (keys(%prms) == 1);
+            output_endifdef($ifdefs{$pident});
+        }
+    }
+    print "};\n#endif\n\n";
+
+    # Output param decoder
+    my %t = generate_trie(keys(%prms));
     locate_long_endings(\%t);
 
-    open local *STDOUT, '>', \$s;
-    generate_code_from_trie(0, \%t);
+    printf "#ifndef %s_decoder\n", $decoder_name_base;
+    printf "static int %s_decoder\n", $decoder_name_base;
+    printf "    (const OSSL_PARAM *p, struct %s_st *r)\n", $decoder_name_base;
+    print "{\n";
+    print "    const char *s;\n\n";
+    print "    memset(r, 0, sizeof(*r));\n";
+    print "    if (p != NULL)\n";
+    print "        for (; (s = p->key) != NULL; p++)\n";
+    generate_decoder_from_trie(0, \%t, \%prms, \%concat_num, \%ifdefs);
+    print "    return 1;\n";
+    print "}\n#endif\n";
+    print "/* End of machine generated */";
+}
+
+sub produce_param_decoder {
+    my $s;
+
+    open(local *STDOUT, '>', \$s);
+    output_param_decoder(@_);
     return $s;
 }

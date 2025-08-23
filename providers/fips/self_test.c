@@ -1,5 +1,5 @@
 /*
- * Copyright 2019-2024 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2019-2025 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -17,6 +17,8 @@
 #include <openssl/proverr.h>
 #include <openssl/rand.h>
 #include "internal/e_os.h"
+#include "internal/fips.h"
+#include "internal/threads_common.h"
 #include "internal/tsan_assist.h"
 #include "prov/providercommon.h"
 #include "crypto/rand.h"
@@ -172,6 +174,7 @@ DEP_INIT_ATTRIBUTE void init(void)
 DEP_FINI_ATTRIBUTE void cleanup(void)
 {
     CRYPTO_THREAD_lock_free(self_test_lock);
+    CRYPTO_THREAD_clean_local_for_fips();
 }
 #endif
 
@@ -299,6 +302,12 @@ err:
 static void set_fips_state(int state)
 {
     tsan_store(&FIPS_state, state);
+}
+
+/* Return 1 if the FIPS self tests are running and 0 otherwise */
+int ossl_fips_self_testing(void)
+{
+    return tsan_load(&FIPS_state) == FIPS_STATE_SELFTEST;
 }
 
 /* This API is triggered either on loading of the FIPS module or on demand */

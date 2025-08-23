@@ -1,5 +1,5 @@
 /*
- * Copyright 2019-2023 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2019-2025 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -23,6 +23,16 @@
  * Encoder can have multiple names, separated with colons in a name string
  */
 #define NAME_SEPARATOR ':'
+
+static void ossl_encoder_free(void *data)
+{
+    OSSL_ENCODER_free(data);
+}
+
+static int ossl_encoder_up_ref(void *data)
+{
+    return OSSL_ENCODER_up_ref(data);
+}
 
 /* Simple method structure constructor and destructor */
 static OSSL_ENCODER *ossl_encoder_new(void)
@@ -191,8 +201,8 @@ static int put_encoder_in_store(void *store, void *method,
         return 0;
 
     return ossl_method_store_add(store, prov, id, propdef, method,
-                                 (int (*)(void *))OSSL_ENCODER_up_ref,
-                                 (void (*)(void *))OSSL_ENCODER_free);
+                                 ossl_encoder_up_ref,
+                                 ossl_encoder_free);
 }
 
 /* Create and populate a encoder method */
@@ -615,8 +625,8 @@ int OSSL_ENCODER_CTX_set_params(OSSL_ENCODER_CTX *ctx,
                                 const OSSL_PARAM params[])
 {
     int ok = 1;
-    size_t i;
-    size_t l;
+    int i;
+    int l;
 
     if (!ossl_assert(ctx != NULL)) {
         ERR_raise(ERR_LIB_OSSL_ENCODER, ERR_R_PASSED_NULL_PARAMETER);

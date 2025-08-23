@@ -1,5 +1,5 @@
 /*
- * Copyright 2016-2024 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2016-2025 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -428,12 +428,6 @@ OSSL_STORE_INFO *OSSL_STORE_load(OSSL_STORE_CTX *ctx)
     if (ctx->loader != NULL)
         OSSL_TRACE(STORE, "Loading next object\n");
 
-    if (ctx->cached_info != NULL
-        && sk_OSSL_STORE_INFO_num(ctx->cached_info) == 0) {
-        sk_OSSL_STORE_INFO_free(ctx->cached_info);
-        ctx->cached_info = NULL;
-    }
-
     if (ctx->cached_info != NULL) {
         v = sk_OSSL_STORE_INFO_shift(ctx->cached_info);
     } else {
@@ -556,14 +550,23 @@ int OSSL_STORE_error(OSSL_STORE_CTX *ctx)
 
 int OSSL_STORE_eof(OSSL_STORE_CTX *ctx)
 {
-    int ret = 1;
+    int ret = 0;
 
-    if (ctx->fetched_loader != NULL)
-        ret = ctx->loader->p_eof(ctx->loader_ctx);
+    if (ctx->cached_info != NULL
+        && sk_OSSL_STORE_INFO_num(ctx->cached_info) == 0) {
+        sk_OSSL_STORE_INFO_free(ctx->cached_info);
+        ctx->cached_info = NULL;
+    }
+
+    if (ctx->cached_info == NULL) {
+        ret = 1;
+        if (ctx->fetched_loader != NULL)
+            ret = ctx->loader->p_eof(ctx->loader_ctx);
 #ifndef OPENSSL_NO_DEPRECATED_3_0
-    if (ctx->fetched_loader == NULL)
-        ret = ctx->loader->eof(ctx->loader_ctx);
+        if (ctx->fetched_loader == NULL)
+            ret = ctx->loader->eof(ctx->loader_ctx);
 #endif
+    }
     return ret != 0;
 }
 
@@ -742,7 +745,8 @@ EVP_PKEY *OSSL_STORE_INFO_get0_PARAMS(const OSSL_STORE_INFO *info)
 EVP_PKEY *OSSL_STORE_INFO_get1_PARAMS(const OSSL_STORE_INFO *info)
 {
     if (info->type == OSSL_STORE_INFO_PARAMS) {
-        EVP_PKEY_up_ref(info->_.params);
+        if (!EVP_PKEY_up_ref(info->_.params))
+            return NULL;
         return info->_.params;
     }
     ERR_raise(ERR_LIB_OSSL_STORE, OSSL_STORE_R_NOT_PARAMETERS);
@@ -759,7 +763,8 @@ EVP_PKEY *OSSL_STORE_INFO_get0_PUBKEY(const OSSL_STORE_INFO *info)
 EVP_PKEY *OSSL_STORE_INFO_get1_PUBKEY(const OSSL_STORE_INFO *info)
 {
     if (info->type == OSSL_STORE_INFO_PUBKEY) {
-        EVP_PKEY_up_ref(info->_.pubkey);
+        if (!EVP_PKEY_up_ref(info->_.pubkey))
+            return NULL;
         return info->_.pubkey;
     }
     ERR_raise(ERR_LIB_OSSL_STORE, OSSL_STORE_R_NOT_A_PUBLIC_KEY);
@@ -776,7 +781,8 @@ EVP_PKEY *OSSL_STORE_INFO_get0_PKEY(const OSSL_STORE_INFO *info)
 EVP_PKEY *OSSL_STORE_INFO_get1_PKEY(const OSSL_STORE_INFO *info)
 {
     if (info->type == OSSL_STORE_INFO_PKEY) {
-        EVP_PKEY_up_ref(info->_.pkey);
+        if (!EVP_PKEY_up_ref(info->_.pkey))
+            return NULL;
         return info->_.pkey;
     }
     ERR_raise(ERR_LIB_OSSL_STORE, OSSL_STORE_R_NOT_A_PRIVATE_KEY);
@@ -793,7 +799,8 @@ X509 *OSSL_STORE_INFO_get0_CERT(const OSSL_STORE_INFO *info)
 X509 *OSSL_STORE_INFO_get1_CERT(const OSSL_STORE_INFO *info)
 {
     if (info->type == OSSL_STORE_INFO_CERT) {
-        X509_up_ref(info->_.x509);
+        if (!X509_up_ref(info->_.x509))
+            return NULL;
         return info->_.x509;
     }
     ERR_raise(ERR_LIB_OSSL_STORE, OSSL_STORE_R_NOT_A_CERTIFICATE);
@@ -810,7 +817,8 @@ X509_CRL *OSSL_STORE_INFO_get0_CRL(const OSSL_STORE_INFO *info)
 X509_CRL *OSSL_STORE_INFO_get1_CRL(const OSSL_STORE_INFO *info)
 {
     if (info->type == OSSL_STORE_INFO_CRL) {
-        X509_CRL_up_ref(info->_.crl);
+        if (!X509_CRL_up_ref(info->_.crl))
+            return NULL;
         return info->_.crl;
     }
     ERR_raise(ERR_LIB_OSSL_STORE, OSSL_STORE_R_NOT_A_CRL);

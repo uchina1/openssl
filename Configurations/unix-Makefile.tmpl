@@ -135,7 +135,7 @@ GENERATED_PODS={- # common0.tmpl provides @generated
                        fill_lines(" ", $COLUMNS - 15,
                                   map { my $x = $_;
                                         (
-                                          grep { 
+                                          grep {
                                                  $unified_info{attributes}->{depends}
                                                  ->{$x}->{$_}->{pod} // 0
                                                }
@@ -540,6 +540,9 @@ debuginfo: $(SHLIBS)
 		$(OBJCOPY) --strip-debug --add-gnu-debuglink=$$i.debug $$i; \
 	done;
 
+cov-report: $(SHLIBS)
+	@set -e; gcovr -r . --txt-metric=branch --html --html-details -o openssl-metrics.html
+
 ##@ Documentation
 build_generated_pods: $(GENERATED_PODS)
 build_docs: build_man_docs build_html_docs ## Create documentation
@@ -633,7 +636,7 @@ clean: libclean ## Clean the workspace, keep the configuration
 	$(RM) tags TAGS doc-nits md-nits
 	$(RM) -r test/test-runs
 	$(RM) providers/fips*.new
-	-find . -type l \! -name '.*' -exec $(RM) {} \;
+	-find . -type l \! -name '.*' \! -wholename './pkcs11-provider/*' -exec $(RM) {} \;
 
 distclean: clean ## Clean and remove the configuration
 	$(RM) include/openssl/configuration.h
@@ -650,7 +653,11 @@ depend: Makefile
 # Install helper targets #############################################
 ##@ Installation
 
-install: install_sw install_ssldirs {- "install_docs" if !$disabled{docs}; -} {- $disabled{fips} ? "" : "install_fips" -} ## Install software and documentation, create OpenSSL directories
+install: Makefile ## Install software and documentation, create OpenSSL directories
+	$(MAKE) install_sw
+	$(MAKE) install_ssldirs
+	{- "\$(MAKE) install_docs" if !$disabled{docs} -}
+	{- "\$(MAKE) install_fips" if !$disabled{fips} -}
 
 uninstall: {- "uninstall_docs" if !$disabled{docs}; -} uninstall_sw {- $disabled{fips} ? "" : "uninstall_fips" -} ## Uninstall software and documentation
 
@@ -809,12 +816,12 @@ install_dev: install_runtime_libs
 		cp $$e "$(DESTDIR)$(PKGCONFIGDIR)/$$fn"; \
 		chmod 644 "$(DESTDIR)$(PKGCONFIGDIR)/$$fn"; \
 	done
-	@$(PERL) $(SRCDIR)/util/mkdir-p.pl $(DESTDIR)$(CMAKECONFIGDIR)
+	@$(PERL) $(SRCDIR)/util/mkdir-p.pl "$(DESTDIR)$(CMAKECONFIGDIR)"
 	@for e in $(INSTALL_EXPORTERS_CMAKE); do \
 		fn=`basename $$e`; \
 		$(ECHO) "install $$e -> $(DESTDIR)$(CMAKECONFIGDIR)/$$fn"; \
-		cp $$e $(DESTDIR)$(CMAKECONFIGDIR)/$$fn; \
-		chmod 644 $(DESTDIR)$(CMAKECONFIGDIR)/$$fn; \
+		cp $$e "$(DESTDIR)$(CMAKECONFIGDIR)/$$fn"; \
+		chmod 644 "$(DESTDIR)$(CMAKECONFIGDIR)/$$fn"; \
 	done
 
 uninstall_dev: uninstall_runtime_libs
@@ -1173,7 +1180,7 @@ generate_buildinfo: generate_doc_buildinfo
 
 .PHONY: doc-nits md-nits
 doc-nits: build_generated_pods ## Evaluate OpenSSL documentation
-	$(PERL) $(SRCDIR)/util/find-doc-nits -c -n -l -e
+	$(PERL) $(SRCDIR)/util/find-doc-nits -c -n -l -e -i -a
 
 # This uses "mdl", the markdownlint application, which is written in ruby.
 # The source is at https://github.com/markdownlint/markdownlint
@@ -1338,8 +1345,7 @@ errors:
            include/internal/asn1.h
            include/internal/sslconf.h );
    my @cryptoskipheaders = ( @sslheaders_tmpl,
-       qw( include/openssl/asn1_mac.h
-           include/openssl/conf_api.h
+       qw( include/openssl/conf_api.h
            include/openssl/ebcdic.h
            include/openssl/opensslconf.h
            include/openssl/symhacks.h ) );
@@ -1413,10 +1419,10 @@ ordinals: build_generated
 test_ordinals:
 	"$(MAKE)" run_tests TESTS=test_ordinals
 
-tags TAGS: FORCE
+tags TAGS: FORCE build_generated
 	rm -f TAGS tags
 	-( cd $(SRCDIR); util/ctags.sh )
-	-etags `find . -name '*.[ch]' -o -name '*.pm'`
+	-etags `find . -name '*.[ch]' -o -name '*.pm' -o -name '*.inc'`
 
 providers/fips.checksum.new: providers/fips.module.sources.new
 	@which unifdef > /dev/null || \

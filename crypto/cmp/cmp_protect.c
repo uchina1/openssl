@@ -1,5 +1,5 @@
 /*
- * Copyright 2007-2023 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2007-2025 The OpenSSL Project Authors. All Rights Reserved.
  * Copyright Nokia 2007-2019
  * Copyright Siemens AG 2015-2019
  *
@@ -10,14 +10,7 @@
  */
 
 #include "cmp_local.h"
-#include "crypto/asn1.h"
-
-/* explicit #includes not strictly needed since implied by the above: */
-#include <openssl/asn1t.h>
-#include <openssl/cmp.h>
-#include <openssl/crmf.h>
-#include <openssl/err.h>
-#include <openssl/x509.h>
+#include "crypto/asn1.h" /* for ossl_X509_ALGOR_from_nid() */
 
 /*
  * This function is also used by the internal verify_PBMAC() in cmp_vfy.c.
@@ -92,11 +85,11 @@ ASN1_BIT_STRING *ossl_cmp_calc_protection(const OSSL_CMP_CTX *ctx,
                                &protection, &sig_len))
             goto end;
 
-        if ((prot = ASN1_BIT_STRING_new()) == NULL)
+        if (sig_len > INT_MAX || (prot = ASN1_BIT_STRING_new()) == NULL)
             goto end;
         /* OpenSSL by default encodes all bit strings as ASN.1 NamedBitList */
         ossl_asn1_string_set_bits_left(prot, 0);
-        if (!ASN1_BIT_STRING_set(prot, protection, sig_len)) {
+        if (!ASN1_BIT_STRING_set(prot, protection, (int)sig_len)) {
             ASN1_BIT_STRING_free(prot);
             prot = NULL;
         }
@@ -130,6 +123,25 @@ ASN1_BIT_STRING *ossl_cmp_calc_protection(const OSSL_CMP_CTX *ctx,
     }
 }
 
+void ossl_cmp_set_own_chain(OSSL_CMP_CTX *ctx)
+{
+    if (!ossl_assert(ctx != NULL))
+        return;
+    /* if not yet done try to build chain using available untrusted certs */
+    if (ctx->chain == NULL) {
+        ossl_cmp_debug(ctx, "trying to build chain for own CMP signer cert");
+        ctx->chain = X509_build_chain(ctx->cert, ctx->untrusted, NULL, 0,
+                                      ctx->libctx, ctx->propq);
+        if (ctx->chain != NULL) {
+            ossl_cmp_debug(ctx, "success building chain for own CMP signer cert");
+        } else {
+            /* dump errors to avoid confusion when printing further ones */
+            OSSL_CMP_CTX_print_errors(ctx);
+            ossl_cmp_warn(ctx, "could not build chain for own CMP signer cert");
+        }
+    }
+}
+
 /* ctx is not const just because ctx->chain may get adapted */
 int ossl_cmp_msg_add_extraCerts(OSSL_CMP_CTX *ctx, OSSL_CMP_MSG *msg)
 {
@@ -142,22 +154,7 @@ int ossl_cmp_msg_add_extraCerts(OSSL_CMP_CTX *ctx, OSSL_CMP_MSG *msg)
         int prepend = X509_ADD_FLAG_UP_REF | X509_ADD_FLAG_NO_DUP
             | X509_ADD_FLAG_PREPEND | X509_ADD_FLAG_NO_SS;
 
-        /* if not yet done try to build chain using available untrusted certs */
-        if (ctx->chain == NULL) {
-            ossl_cmp_debug(ctx,
-                           "trying to build chain for own CMP signer cert");
-            ctx->chain = X509_build_chain(ctx->cert, ctx->untrusted, NULL, 0,
-                                          ctx->libctx, ctx->propq);
-            if (ctx->chain != NULL) {
-                ossl_cmp_debug(ctx,
-                               "success building chain for own CMP signer cert");
-            } else {
-                /* dump errors to avoid confusion when printing further ones */
-                OSSL_CMP_CTX_print_errors(ctx);
-                ossl_cmp_warn(ctx,
-                              "could not build chain for own CMP signer cert");
-            }
-        }
+        ossl_cmp_set_own_chain(ctx);
         if (ctx->chain != NULL) {
             if (!ossl_x509_add_certs_new(&msg->extraCerts, ctx->chain, prepend))
                 return 0;

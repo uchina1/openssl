@@ -1,5 +1,5 @@
 /*
- * Copyright 2022-2024 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2022-2025 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -279,12 +279,12 @@ static TXE *qtx_resize_txe(OSSL_QTX *qtx, TXE_LIST *txl, TXE *txe, size_t n)
      * data.
      */
     txe2 = OPENSSL_realloc(txe, sizeof(TXE) + n);
-    if (txe2 == NULL || txe == txe2) {
+    if (txe2 == NULL) {
         if (p == NULL)
             ossl_list_txe_insert_head(txl, txe);
         else
             ossl_list_txe_insert_after(txl, p, txe);
-        return txe2;
+        return NULL;
     }
 
     if (p == NULL)
@@ -541,7 +541,7 @@ static int qtx_encrypt_into_txe(OSSL_QTX *qtx, struct iovec_cur *cur, TXE *txe,
     }
 
     /* Feed AAD data. */
-    if (EVP_CipherUpdate(cctx, NULL, &l, hdr, hdr_len) != 1) {
+    if (EVP_CipherUpdate(cctx, NULL, &l, hdr, (int)hdr_len) != 1) {
         ERR_raise(ERR_LIB_SSL, ERR_R_EVP_LIB);
         return 0;
     }
@@ -556,7 +556,7 @@ static int qtx_encrypt_into_txe(OSSL_QTX *qtx, struct iovec_cur *cur, TXE *txe,
             break;
 
         if (EVP_CipherUpdate(cctx, txe_data(txe) + txe->data_len,
-                             &l, src, src_len) != 1) {
+                             &l, src, (int)src_len) != 1) {
             ERR_raise(ERR_LIB_SSL, ERR_R_EVP_LIB);
             return 0;
         }
@@ -842,15 +842,19 @@ int ossl_qtx_write_pkt(OSSL_QTX *qtx, const OSSL_QTX_PKT *pkt)
 
         if (!was_coalescing) {
             /* Set addresses in TXE. */
-            if (pkt->peer != NULL)
-                txe->peer = *pkt->peer;
-            else
+            if (pkt->peer != NULL) {
+                if (!BIO_ADDR_copy(&txe->peer, pkt->peer))
+                    return 0;
+            } else {
                 BIO_ADDR_clear(&txe->peer);
+            }
 
-            if (pkt->local != NULL)
-                txe->local = *pkt->local;
-            else
+            if (pkt->local != NULL) {
+                if (!BIO_ADDR_copy(&txe->local, pkt->local))
+                    return 0;
+            } else {
                 BIO_ADDR_clear(&txe->local);
+            }
         }
 
         ret = qtx_mutate_write(qtx, pkt, txe, enc_level);

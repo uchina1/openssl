@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2023 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2015-2025 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -66,7 +66,7 @@ typedef CON_FUNC_RETURN (*confunc_f) (SSL_CONNECTION *s, WPACKET *pkt);
 
 int ssl3_take_mac(SSL_CONNECTION *s);
 int check_in_list(SSL_CONNECTION *s, uint16_t group_id, const uint16_t *groups,
-                  size_t num_groups, int checkallow);
+                  size_t num_groups, int checkallow, size_t *pos);
 int create_synthetic_message_hash(SSL_CONNECTION *s,
                                   const unsigned char *hashval,
                                   size_t hashlen, const unsigned char *hrr,
@@ -148,7 +148,7 @@ __owur MSG_PROCESS_RETURN tls_process_certificate_request(SSL_CONNECTION *s,
                                                           PACKET *pkt);
 __owur MSG_PROCESS_RETURN tls_process_new_session_ticket(SSL_CONNECTION *s,
                                                          PACKET *pkt);
-__owur int tls_process_cert_status_body(SSL_CONNECTION *s, PACKET *pkt);
+__owur int tls_process_cert_status_body(SSL_CONNECTION *s, size_t chainidx, PACKET *pkt);
 __owur MSG_PROCESS_RETURN tls_process_cert_status(SSL_CONNECTION *s,
                                                   PACKET *pkt);
 __owur MSG_PROCESS_RETURN tls_process_server_done(SSL_CONNECTION *s,
@@ -168,7 +168,7 @@ __owur int ssl_do_client_cert_cb(SSL_CONNECTION *s, X509 **px509,
 __owur CON_FUNC_RETURN tls_construct_client_key_exchange(SSL_CONNECTION *s,
                                                          WPACKET *pkt);
 __owur int tls_client_key_exchange_post_work(SSL_CONNECTION *s);
-__owur int tls_construct_cert_status_body(SSL_CONNECTION *s, WPACKET *pkt);
+__owur int tls_construct_cert_status_body(SSL_CONNECTION *s, size_t chainidx, WPACKET *pkt);
 __owur CON_FUNC_RETURN tls_construct_cert_status(SSL_CONNECTION *s,
                                                  WPACKET *pkt);
 __owur MSG_PROCESS_RETURN tls_process_key_exchange(SSL_CONNECTION *s,

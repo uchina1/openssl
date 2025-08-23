@@ -1,5 +1,5 @@
 /*
- * Copyright 2022-2024 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2022-2025 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -36,7 +36,8 @@ static int is_fips = 0;
 /* The ssltrace test assumes some options are switched on/off */
 #if !defined(OPENSSL_NO_SSL_TRACE) \
     && defined(OPENSSL_NO_BROTLI) && defined(OPENSSL_NO_ZSTD) \
-    && !defined(OPENSSL_NO_ECX) && !defined(OPENSSL_NO_DH)
+    && !defined(OPENSSL_NO_ECX) && !defined(OPENSSL_NO_DH) \
+    && !defined(OPENSSL_NO_ML_DSA) && !defined(OPENSSL_NO_ML_KEM)
 # define DO_SSL_TRACE_TEST
 #endif
 
@@ -146,7 +147,7 @@ static int test_quic_write_read(int idx)
             if (!TEST_true(SSL_read_ex(clientquic, buf, 1, &numbytes))
                     || !TEST_size_t_eq(numbytes, 1)
                     || !TEST_true(SSL_has_pending(clientquic))
-                    || !TEST_int_eq(SSL_pending(clientquic), msglen - 1)
+                    || !TEST_int_eq(SSL_pending(clientquic), (int)(msglen - 1))
                     || !TEST_true(SSL_read_ex(clientquic, buf + 1,
                                               sizeof(buf) - 1, &numbytes))
                     || !TEST_mem_eq(buf, numbytes + 1, msg, msglen))
@@ -262,9 +263,9 @@ static int test_fin_only_blocking(void)
     if (!TEST_int_eq(SSL_get_error(clientquic, 0), SSL_ERROR_ZERO_RETURN)
                /*
                 * We expect the SSL_read_ex to not have blocked so this should
-                * be very fast. 20ms should be plenty.
+                * be very fast. 40ms should be plenty.
                 */
-            || !TEST_uint64_t_le(ossl_time2ms(timediff), 20))
+            || !TEST_uint64_t_le(ossl_time2ms(timediff), 40))
         goto end;
 
     if (!TEST_true(qtest_shutdown(qtserv, clientquic)))
@@ -297,7 +298,8 @@ static int test_ciphersuites(void)
 #endif
         TLS1_3_CK_AES_128_GCM_SHA256
     };
-    size_t i, j;
+    size_t i;
+    int j;
 
     if (!TEST_ptr(ctx))
         return 0;
@@ -441,7 +443,7 @@ static void strip_line_ends(char *str)
 static int compare_with_file(BIO *membio)
 {
     BIO *file = NULL, *newfile = NULL;
-    char buf1[512], buf2[512];
+    char buf1[8192], buf2[8192];
     char *reffile;
     int ret = 0;
     size_t i;
@@ -472,19 +474,27 @@ static int compare_with_file(BIO *membio)
         goto err;
 
     while (BIO_gets(file, buf1, sizeof(buf1)) > 0) {
+        size_t line_len;
+
         if (BIO_gets(membio, buf2, sizeof(buf2)) <= 0) {
             TEST_error("Failed reading mem data");
             goto err;
         }
         strip_line_ends(buf1);
         strip_line_ends(buf2);
-        if (strlen(buf1) != strlen(buf2)) {
+        line_len = strlen(buf1);
+        if (line_len > 0 && buf1[line_len - 1] == '?') {
+            /* Wildcard at the EOL means ignore anything after it */
+            if (strlen(buf2) > line_len)
+                buf2[line_len] = '\0';
+        }
+        if (line_len != strlen(buf2)) {
             TEST_error("Actual and ref line data length mismatch");
             TEST_info("%s", buf1);
             TEST_info("%s", buf2);
            goto err;
         }
-        for (i = 0; i < strlen(buf1); i++) {
+        for (i = 0; i < line_len; i++) {
             /* '?' is a wild card character in the reference text */
             if (buf1[i] == '?')
                 buf2[i] = '?';
@@ -553,13 +563,151 @@ static int test_ssl_trace(void)
 }
 #endif
 
+#ifndef OPENSSL_NO_SSL_TRACE
+enum {
+    INITIAL = 0,
+    GATHER_TOKEN = 1,
+    CHECK_TOKEN = 2,
+    SUCCESS = 3,
+    FAILED = 4
+};
+
+static int find_new_token_data(BIO *membio)
+{
+    char buf[1024];
+    int state = INITIAL;
+    char *tmpstring;
+    char *tokenval = NULL;
+    /*
+     * This is a state machine, in which we traverse the ssl trace
+     * looking for a sequence of items
+     * The states are:
+     * +---Current State---|----------Action-------------|---Next State---+
+     * |      INITIAL      | "Received Frame: New token" | GATHER_TOKEN   |
+     * |                   | !"Received Frame: New token"| INITIAL        |
+     * |-------------------|-----------------------------|----------------|
+     * |    GATHER_TOKEN   | "Token: <TOKENVAL>"         | CHECK_TOKEN    |
+     * |                   | !"Token: <TOKENVAL>"        | FAILED         |
+     * |-------------------|-----------------------------|----------------|
+     * |    CHECK_TOKEN    | "Token: <TOKENVAL>"         | SUCCESS        |
+     * |                   | EOF                         | FAILED         |
+     * +-------------------|-----------------------------|----------------|
+     */
+
+    while (state != SUCCESS
+           && state != FAILED
+           && BIO_gets(membio, buf, sizeof(buf)) > 0) {
+        switch (state) {
+        case INITIAL:
+            if (strstr(buf, "Received Frame: New token"))
+                state = GATHER_TOKEN;
+            break;
+        case GATHER_TOKEN:
+            TEST_info("Found New Token Marker\n");
+            tmpstring = strstr(buf, "Token: ");
+            if (tmpstring == NULL) {
+                TEST_info("Next line did not contain a new token\n");
+                state = FAILED;
+            } else {
+                if (!TEST_ptr(tokenval = OPENSSL_strdup(tmpstring)))
+                    return 0;
+                state = CHECK_TOKEN;
+                TEST_info("Recorded Token %s\n", tokenval);
+            }
+            break;
+        case CHECK_TOKEN:
+            tmpstring = strstr(buf, "Token: ");
+            if (tmpstring != NULL
+                && !strcmp(tmpstring, tokenval)) {
+                state = SUCCESS;
+                TEST_info("Matched next connection token %s\n", tmpstring);
+            }
+        default:
+            break;
+        }
+    }
+
+    OPENSSL_free(tokenval);
+    return (state == SUCCESS);
+}
+
+static int test_new_token(void)
+{
+    SSL_CTX *cctx = NULL;
+    SSL *clientquic = NULL;
+    SSL *clientquic2 = NULL;
+    QUIC_TSERVER *qtserv = NULL;
+    QUIC_TSERVER *qtserv2 = NULL;
+    int testresult = 0;
+    BIO *bio = NULL;
+    char msg[] = "The Quic Brown Fox";
+    size_t written;
+
+    if (!TEST_ptr(cctx = SSL_CTX_new_ex(libctx, NULL, OSSL_QUIC_client_method()))
+        || !TEST_ptr(bio = BIO_new(BIO_s_mem()))
+        || !TEST_true(qtest_create_quic_objects(libctx, cctx, NULL, cert,
+                                                privkey,
+                                                QTEST_FLAG_FAKE_TIME,
+                                                &qtserv,
+                                                &clientquic, NULL, NULL)))
+
+        goto err;
+
+    SSL_set_msg_callback(clientquic, SSL_trace);
+    SSL_set_msg_callback_arg(clientquic, bio);
+
+    if (!TEST_true(qtest_create_quic_connection(qtserv, clientquic)))
+        goto err;
+
+    /* Send data from the client */
+    if (!SSL_write_ex(clientquic, msg, sizeof(msg), &written))
+        goto err;
+
+    if (written != sizeof(msg))
+        goto err;
+
+    /* Receive data at the server */
+    ossl_quic_tserver_tick(qtserv);
+
+    if (!TEST_true(qtest_create_quic_objects(libctx, cctx, NULL, cert,
+                                             privkey,
+                                             QTEST_FLAG_FAKE_TIME,
+                                             &qtserv2,
+                                             &clientquic2, NULL, NULL)))
+        goto err;
+
+    SSL_set_msg_callback(clientquic2, SSL_trace);
+    SSL_set_msg_callback_arg(clientquic2, bio);
+
+    /* once we have our new token, create the subsequent connection */
+    if (!TEST_true(qtest_create_quic_connection(qtserv2, clientquic2)))
+        goto err;
+
+    /* Skip the comparison of the trace when the fips provider is used. */
+    if (!TEST_true(find_new_token_data(bio)))
+        goto err;
+
+    testresult = 1;
+ err:
+    ossl_quic_tserver_free(qtserv);
+    ossl_quic_tserver_free(qtserv2);
+    SSL_free(clientquic);
+    SSL_free(clientquic2);
+    SSL_CTX_free(cctx);
+    BIO_free(bio);
+
+    return testresult;
+}
+#endif
+
 static int ensure_valid_ciphers(const STACK_OF(SSL_CIPHER) *ciphers)
 {
-    size_t i;
+    int i;
 
     /* Ensure ciphersuite list is suitably subsetted. */
-    for (i = 0; i < (size_t)sk_SSL_CIPHER_num(ciphers); ++i) {
+    for (i = 0; i < sk_SSL_CIPHER_num(ciphers); ++i) {
         const SSL_CIPHER *cipher = sk_SSL_CIPHER_value(ciphers, i);
+
         switch (SSL_CIPHER_get_id(cipher)) {
             case TLS1_3_CK_AES_128_GCM_SHA256:
             case TLS1_3_CK_AES_256_GCM_SHA384:
@@ -859,8 +1007,8 @@ static int test_bio_ssl(void)
         goto err;
 
     if (!TEST_true(qtest_create_quic_objects(libctx, NULL, NULL, cert, privkey,
-                                             0, &qtserv, &clientquic, NULL,
-                                             NULL)))
+                                             QTEST_FLAG_FAKE_TIME, &qtserv,
+                                             &clientquic, NULL, NULL)))
         goto err;
 
     msglen = strlen(msg);
@@ -885,6 +1033,7 @@ static int test_bio_ssl(void)
 
         if (!servererr && rets <= 0) {
             ossl_quic_tserver_tick(qtserv);
+            qtest_add_time(100);
             servererr = ossl_quic_tserver_is_term_any(qtserv);
             if (!servererr)
                 rets = ossl_quic_tserver_is_handshake_confirmed(qtserv);
@@ -1155,10 +1304,8 @@ static int use_session_cb(SSL *ssl, const EVP_MD *md, const unsigned char **id,
 {
     use_session_cb_cnt++;
 
-    if (clientpsk == NULL)
+    if (clientpsk == NULL || !SSL_SESSION_up_ref(clientpsk))
         return 0;
-
-    SSL_SESSION_up_ref(clientpsk);
 
     *sess = clientpsk;
     *id = (const unsigned char *)pskid;
@@ -1172,15 +1319,16 @@ static int find_session_cb(SSL *ssl, const unsigned char *identity,
 {
     find_session_cb_cnt++;
 
-    if (serverpsk == NULL)
+    if (serverpsk == NULL || !SSL_SESSION_up_ref(serverpsk))
         return 0;
 
     /* Identity should match that set by the client */
     if (strlen(pskid) != identity_len
-            || strncmp(pskid, (const char *)identity, identity_len) != 0)
+            || strncmp(pskid, (const char *)identity, identity_len) != 0) {
+        SSL_SESSION_free(serverpsk);
         return 0;
+    }
 
-    SSL_SESSION_up_ref(serverpsk);
     *sess = serverpsk;
 
     return 1;
@@ -1206,10 +1354,9 @@ static int test_quic_psk(void)
     find_session_cb_cnt = 0;
 
     clientpsk = serverpsk = create_a_psk(clientquic, SHA384_DIGEST_LENGTH);
-    if (!TEST_ptr(clientpsk))
-        goto end;
     /* We already had one ref. Add another one */
-    SSL_SESSION_up_ref(clientpsk);
+    if (!TEST_ptr(clientpsk) || !TEST_true(SSL_SESSION_up_ref(clientpsk)))
+        goto end;
 
     if (!TEST_true(qtest_create_quic_connection(qtserv, clientquic))
             || !TEST_int_eq(1, find_session_cb_cnt)
@@ -1724,7 +1871,6 @@ struct tparam_test {
     size_t      buf_len;
 };
 
-static const unsigned char retry_scid_1[8] = { 0 };
 
 static const unsigned char disable_active_migration_1[] = {
     0x00
@@ -1852,8 +1998,6 @@ static const struct tparam_test tparam_tests[] = {
     TPARAM_CHECK_DROP(ORIG_DCID,
                       "ORIG_DCID was not sent but is required")
 
-    TPARAM_CHECK_INJECT_A(RETRY_SCID, retry_scid_1,
-                          "RETRY_SCID sent when not performing a retry")
     TPARAM_CHECK_DROP_INJECT_A(DISABLE_ACTIVE_MIGRATION, disable_active_migration_1,
                                "DISABLE_ACTIVE_MIGRATION is malformed")
     TPARAM_CHECK_INJECT(UNKNOWN_1, NULL, 0,
@@ -2256,8 +2400,682 @@ static int test_session_cb(void)
     return testresult;
 }
 
-/***********************************************************************************/
+static int test_domain_flags(void)
+{
+    int testresult = 0;
+    SSL_CTX *ctx = NULL;
+    SSL *domain = NULL, *listener = NULL, *other_conn = NULL;
+    uint64_t domain_flags = 0;
 
+    if (!TEST_ptr(ctx = SSL_CTX_new_ex(libctx, NULL, OSSL_QUIC_client_method()))
+        || !TEST_true(SSL_CTX_get_domain_flags(ctx, &domain_flags))
+        || !TEST_uint64_t_ne(domain_flags, 0)
+        || !TEST_uint64_t_ne(domain_flags & (SSL_DOMAIN_FLAG_SINGLE_THREAD
+                                             | SSL_DOMAIN_FLAG_MULTI_THREAD), 0)
+        || !TEST_uint64_t_ne(domain_flags & SSL_DOMAIN_FLAG_LEGACY_BLOCKING, 0)
+        || !TEST_true(SSL_CTX_set_domain_flags(ctx, SSL_DOMAIN_FLAG_SINGLE_THREAD))
+        || !TEST_true(SSL_CTX_get_domain_flags(ctx, &domain_flags))
+        || !TEST_uint64_t_eq(domain_flags, SSL_DOMAIN_FLAG_SINGLE_THREAD)
+        || !TEST_ptr(domain = SSL_new_domain(ctx, 0))
+        || !TEST_true(SSL_get_domain_flags(domain, &domain_flags))
+        || !TEST_uint64_t_eq(domain_flags, SSL_DOMAIN_FLAG_SINGLE_THREAD)
+        || !TEST_true(other_conn = SSL_new(ctx))
+        || !TEST_true(SSL_get_domain_flags(other_conn, &domain_flags))
+        || !TEST_uint64_t_eq(domain_flags, SSL_DOMAIN_FLAG_SINGLE_THREAD)
+        || !TEST_true(SSL_is_domain(domain))
+        || !TEST_false(SSL_is_domain(other_conn))
+        || !TEST_ptr_eq(SSL_get0_domain(domain), domain)
+        || !TEST_ptr_null(SSL_get0_domain(other_conn))
+        || !TEST_ptr(listener = SSL_new_listener_from(domain, 0))
+        || !TEST_true(SSL_is_listener(listener))
+        || !TEST_false(SSL_is_domain(listener))
+        || !TEST_ptr_eq(SSL_get0_domain(listener), domain)
+        || !TEST_ptr_eq(SSL_get0_listener(listener), listener))
+        goto err;
+
+    testresult = 1;
+err:
+    SSL_free(domain);
+    SSL_free(listener);
+    SSL_free(other_conn);
+    SSL_CTX_free(ctx);
+    return testresult;
+}
+
+/*
+ * Test that calling SSL_handle_events() early behaves as expected
+ */
+static int test_early_ticks(void)
+{
+    SSL_CTX *cctx = SSL_CTX_new_ex(libctx, NULL, OSSL_QUIC_client_method());
+    SSL *clientquic = NULL;
+    QUIC_TSERVER *qtserv = NULL;
+    int testresult = 0;
+    struct timeval tv;
+    int inf = 0;
+
+    if (!TEST_ptr(cctx)
+            || !TEST_true(qtest_create_quic_objects(libctx, cctx, NULL, cert,
+                                                    privkey, QTEST_FLAG_FAKE_TIME,
+                                                    &qtserv,
+                                                    &clientquic, NULL, NULL)))
+        goto err;
+
+    if (!TEST_true(SSL_in_before(clientquic)))
+        goto err;
+
+    if (!TEST_true(SSL_handle_events(clientquic)))
+        goto err;
+
+    if (!TEST_true(SSL_get_event_timeout(clientquic, &tv, &inf))
+            || !TEST_true(inf))
+        goto err;
+
+    if (!TEST_false(SSL_has_pending(clientquic))
+            || !TEST_int_eq(SSL_pending(clientquic), 0))
+        goto err;
+
+    if (!TEST_true(SSL_in_before(clientquic)))
+        goto err;
+
+    if (!TEST_true(qtest_create_quic_connection(qtserv, clientquic)))
+        goto err;
+
+    if (!TEST_false(SSL_in_before(clientquic)))
+        goto err;
+
+    testresult = 1;
+ err:
+    SSL_free(clientquic);
+    SSL_CTX_free(cctx);
+    ossl_quic_tserver_free(qtserv);
+    return testresult;
+}
+
+static int select_alpn(SSL *ssl, const unsigned char **out,
+                       unsigned char *out_len, const unsigned char *in,
+                       unsigned int in_len, void *arg)
+{
+    static unsigned char alpn[] = { 8, 'o', 's', 's', 'l', 't', 'e', 's', 't' };
+
+    if (SSL_select_next_proto((unsigned char **)out, out_len, alpn, sizeof(alpn),
+                              in, in_len) == OPENSSL_NPN_NEGOTIATED)
+        return SSL_TLSEXT_ERR_OK;
+    return SSL_TLSEXT_ERR_ALERT_FATAL;
+}
+
+static SSL_CTX *create_client_ctx(void)
+{
+    SSL_CTX *ssl_ctx;
+
+    if (!TEST_ptr(ssl_ctx = SSL_CTX_new_ex(libctx, NULL, OSSL_QUIC_client_method()))) {
+        SSL_CTX_free(ssl_ctx);
+        ssl_ctx = NULL;
+    }
+
+    return ssl_ctx;
+}
+
+static SSL_CTX *create_server_ctx(void)
+{
+    SSL_CTX *ssl_ctx;
+
+    if (!TEST_ptr(ssl_ctx = SSL_CTX_new_ex(libctx, NULL, OSSL_QUIC_server_method()))
+        || !TEST_true(SSL_CTX_use_certificate_file(ssl_ctx, cert, SSL_FILETYPE_PEM))
+        || !TEST_true(SSL_CTX_use_PrivateKey_file(ssl_ctx, privkey, SSL_FILETYPE_PEM))) {
+        SSL_CTX_free(ssl_ctx);
+        ssl_ctx = NULL;
+    } else {
+        SSL_CTX_set_alpn_select_cb(ssl_ctx, select_alpn, NULL);
+        SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_NONE, NULL);
+    }
+
+    return ssl_ctx;
+}
+
+static BIO_ADDR *create_addr(struct in_addr *ina, short int port)
+{
+    BIO_ADDR *addr = NULL;
+
+    if (!TEST_ptr(addr = BIO_ADDR_new()))
+        return NULL;
+
+    if (!TEST_true(BIO_ADDR_rawmake(addr, AF_INET, ina, sizeof(struct in_addr),
+                                    htons(port)))) {
+        BIO_ADDR_free(addr);
+        return NULL;
+    }
+
+    return addr;
+}
+
+static int bio_addr_bind(BIO *bio, BIO_ADDR *addr)
+{
+    int bio_caps = BIO_DGRAM_CAP_HANDLES_DST_ADDR | BIO_DGRAM_CAP_HANDLES_SRC_ADDR;
+
+    if (!TEST_true(BIO_dgram_set_caps(bio, bio_caps)))
+        return 0;
+
+    if (!TEST_int_eq(BIO_dgram_set0_local_addr(bio, addr), 1))
+        return 0;
+
+    return 1;
+}
+
+static SSL *ql_create(SSL_CTX *ssl_ctx, BIO *bio)
+{
+    SSL *qserver;
+
+    if (!TEST_ptr(qserver = SSL_new_listener(ssl_ctx, 0))) {
+        BIO_free(bio);
+        return NULL;
+    }
+
+    SSL_set_bio(qserver, bio, bio);
+
+    if (!TEST_true(SSL_listen(qserver))) {
+        SSL_free(qserver);
+        return NULL;
+    }
+
+    return qserver;
+}
+
+static int qc_init(SSL *qconn, BIO_ADDR *dst_addr)
+{
+    static unsigned char alpn[] = { 8, 'o', 's', 's', 'l', 't', 'e', 's', 't' };
+
+    if (!TEST_true(SSL_set1_initial_peer_addr(qconn, dst_addr)))
+        return 0;
+
+    if (!TEST_false(SSL_set_alpn_protos(qconn, alpn, sizeof(alpn))))
+        return 0;
+
+    return 1;
+}
+
+static int test_ssl_new_from_listener(void)
+{
+    SSL_CTX *lctx = NULL, *sctx = NULL;
+    SSL *qlistener = NULL, *qserver = NULL, *qconn = 0;
+    int testresult = 0;
+    int chk;
+    BIO *lbio = NULL, *sbio = NULL;
+    BIO_ADDR *addr = NULL;
+    struct in_addr ina;
+
+    ina.s_addr = htonl(0x1f000001);
+    if (!TEST_ptr(lctx = create_server_ctx())
+        || !TEST_ptr(sctx = create_server_ctx())
+        || !TEST_true(BIO_new_bio_dgram_pair(&lbio, 0, &sbio, 0)))
+        goto err;
+
+    if (!TEST_ptr(addr = create_addr(&ina, 8040)))
+        goto err;
+
+    if (!TEST_true(bio_addr_bind(lbio, addr)))
+        goto err;
+    addr = NULL;
+
+    if (!TEST_ptr(addr = create_addr(&ina, 4080)))
+        goto err;
+
+    if (!TEST_true(bio_addr_bind(sbio, addr)))
+        goto err;
+    addr = NULL;
+
+    qlistener = ql_create(lctx, lbio);
+    lbio = NULL;
+    if (!TEST_ptr(qlistener))
+        goto err;
+
+    qserver = ql_create(sctx, sbio);
+    sbio = NULL;
+    if (!TEST_ptr(qserver))
+        goto err;
+
+    if (!TEST_ptr(qconn = SSL_new_from_listener(qlistener, 0)))
+        goto err;
+
+    if (!TEST_ptr(addr = create_addr(&ina, 4080)))
+        goto err;
+
+    chk = qc_init(qconn, addr);
+    if (!TEST_true(chk))
+        goto err;
+
+    while ((chk = SSL_do_handshake(qconn)) == -1) {
+        SSL_handle_events(qserver);
+        SSL_handle_events(qlistener);
+    }
+
+    if (!TEST_int_gt(chk, 0)) {
+        TEST_info("SSL_do_handshake() failed\n");
+        goto err;
+    }
+
+    testresult = 1;
+ err:
+    SSL_free(qconn);
+    SSL_free(qlistener);
+    SSL_free(qserver);
+    BIO_free(lbio);
+    BIO_free(sbio);
+    SSL_CTX_free(sctx);
+    SSL_CTX_free(lctx);
+    BIO_ADDR_free(addr);
+
+    return testresult;
+}
+
+static int test_server_method_with_ssl_new(void)
+{
+    SSL_CTX *ctx = NULL;
+    SSL *ssl = NULL;
+    int ret = 0;
+    unsigned long err;
+
+    /* Create a new SSL_CTX using the QUIC server method */
+    ctx = SSL_CTX_new_ex(libctx, NULL, OSSL_QUIC_server_method());
+    if (!TEST_ptr(ctx))
+        goto end;
+
+    /* Try to create a new SSL object - this should fail */
+    ssl = SSL_new(ctx);
+
+    /* Check that SSL_new() returned NULL */
+    if (!TEST_ptr_null(ssl))
+        goto end;
+
+    /* Check for the expected error */
+    err = ERR_peek_error();
+    if (!TEST_true(ERR_GET_LIB(err) == ERR_LIB_SSL &&
+                   ERR_GET_REASON(err) == ERR_R_SHOULD_NOT_HAVE_BEEN_CALLED))
+        goto end;
+
+    ret = 1;
+
+end:
+    SSL_free(ssl);
+    SSL_CTX_free(ctx);
+    return ret;
+}
+
+static int create_quic_ssl_objects(SSL_CTX *sctx, SSL_CTX *cctx,
+                                   SSL **lssl, SSL **cssl)
+{
+    BIO_ADDR *addr = NULL;
+    struct in_addr ina;
+    BIO *cbio = NULL, *sbio = NULL;
+    int ret = 0;
+
+    *cssl = *lssl = NULL;
+    ina.s_addr = htonl(0x1f000001);
+
+    if (!TEST_true(BIO_new_bio_dgram_pair(&cbio, 0, &sbio, 0)))
+        goto err;
+
+    if (!TEST_ptr(addr = create_addr(&ina, 8040)))
+        goto err;
+
+    if (!TEST_true(bio_addr_bind(sbio, addr)))
+        goto err;
+    addr = NULL;
+
+    *lssl = ql_create(sctx, sbio);
+    sbio = NULL;
+    if (!TEST_ptr(*lssl))
+        goto err;
+
+    if (!TEST_ptr(*cssl = SSL_new(cctx)))
+        goto err;
+
+    if (!TEST_ptr(addr = create_addr(&ina, 8040)))
+        goto err;
+    if (!TEST_true(bio_addr_bind(cbio, addr)))
+        goto err;
+
+    if (!TEST_true(qc_init(*cssl, addr))) {
+        addr = NULL;
+        goto err;
+    }
+    addr = NULL;
+    SSL_set_bio(*cssl, cbio, cbio);
+    cbio = NULL;
+
+    ret = 1;
+
+ err:
+    if (!ret) {
+        SSL_free(*cssl);
+        SSL_free(*lssl);
+        *cssl = *lssl = NULL;
+    }
+    BIO_free(cbio);
+    BIO_free(sbio);
+    BIO_ADDR_free(addr);
+
+    return ret;
+}
+
+static int test_ssl_accept_connection(void)
+{
+    SSL_CTX *cctx = NULL, *sctx = NULL;
+    SSL *clientssl = NULL, *serverssl = NULL, *qlistener = NULL;
+    int testresult = 0;
+    int ret, i;
+
+    if (!TEST_ptr(sctx = create_server_ctx())
+        || !TEST_ptr(cctx = create_client_ctx()))
+        goto err;
+
+    if (!create_quic_ssl_objects(sctx, cctx, &qlistener, &clientssl))
+        goto err;
+
+    /* Calling SSL_accept() on a listener is expected to fail */
+    ret = SSL_accept(qlistener);
+    if (!TEST_int_le(ret, 0)
+        || !TEST_int_eq(SSL_get_error(qlistener, ret), SSL_ERROR_SSL))
+        goto err;
+
+    /* Send ClientHello and server retry */
+    for (i = 0; i < 2; i++) {
+        ret = SSL_connect(clientssl);
+        if (!TEST_int_le(ret, 0)
+            || !TEST_int_eq(SSL_get_error(clientssl, ret), SSL_ERROR_WANT_READ))
+            goto err;
+        SSL_handle_events(qlistener);
+    }
+
+    /* We expect a server SSL object which has not yet completed its handshake */
+    serverssl = SSL_accept_connection(qlistener, 0);
+    if (!TEST_ptr(serverssl) || !TEST_false(SSL_is_init_finished(serverssl)))
+        goto err;
+
+    /* Call SSL_accept() and SSL_connect() until we are connected */
+    if (!TEST_true(create_bare_ssl_connection(serverssl, clientssl,
+                                              SSL_ERROR_NONE, 0, 0)))
+        goto err;
+
+    testresult = 1;
+
+ err:
+    SSL_free(serverssl);
+    SSL_free(clientssl);
+    SSL_free(qlistener);
+    SSL_CTX_free(sctx);
+    SSL_CTX_free(cctx);
+
+    return testresult;
+}
+
+static SSL *quic_verify_ssl = NULL;
+
+static int quic_verify_cb(int ok, X509_STORE_CTX *ctx)
+{
+    SSL *cssl = (SSL *)X509_STORE_CTX_get_ex_data(ctx, SSL_get_ex_data_X509_STORE_CTX_idx());
+
+    /* Confirm we got the SSL object we were expecting */
+    return TEST_ptr_eq(cssl, quic_verify_ssl);
+}
+
+static int test_ssl_set_verify(void)
+{
+    SSL_CTX *cctx = NULL, *sctx = NULL;
+    SSL *clientssl = NULL, *serverssl = NULL, *qlistener = NULL;
+    int testresult = 0;
+    int ret, i;
+
+    if (!TEST_ptr(sctx = create_server_ctx())
+        || !TEST_ptr(cctx = create_client_ctx()))
+        goto err;
+
+    if (!create_quic_ssl_objects(sctx, cctx, &qlistener, &clientssl))
+        goto err;
+
+    quic_verify_ssl = clientssl;
+    SSL_set_verify(clientssl, SSL_VERIFY_PEER, quic_verify_cb);
+
+    /* Send ClientHello and server retry */
+    for (i = 0; i < 2; i++) {
+        ret = SSL_connect(clientssl);
+        if (!TEST_int_le(ret, 0)
+            || !TEST_int_eq(SSL_get_error(clientssl, ret), SSL_ERROR_WANT_READ))
+            goto err;
+        SSL_handle_events(qlistener);
+    }
+
+    /* We expect a server SSL object which has not yet completed its handshake */
+    serverssl = SSL_accept_connection(qlistener, 0);
+
+    /* Call SSL_accept() and SSL_connect() until we are connected */
+    if (!TEST_true(create_bare_ssl_connection(serverssl, clientssl,
+                                              SSL_ERROR_NONE, 0, 0)))
+        goto err;
+
+    testresult = 1;
+
+ err:
+    SSL_free(serverssl);
+    SSL_free(clientssl);
+    SSL_free(qlistener);
+    SSL_CTX_free(sctx);
+    SSL_CTX_free(cctx);
+
+    return testresult;
+}
+
+/*
+ * Creates server-initiated streams (1 uni stream if stream_opt=0, 1 bidi stream
+ * if stream_opt=1, and both a uni and bidi stream if stream_opt=2) and tests
+ * that client calling SSL_accept_stream with accept_flags behaves as expected.
+ */
+static int create_accept_stream(SSL *serverssl, SSL *clientssl,
+                                uint64_t accept_flags, int stream_opt)
+{
+    unsigned char buf[16], msg[] = "Hello, World!";
+    SSL *clientstream = NULL, *serverstream = NULL, *serverstream2 = NULL;
+    int create_uni = stream_opt != 1, create_bidi = stream_opt != 0;
+    int ret = 0, should_accept = 1, stream_type;
+    size_t nread, nwritten;
+
+    if (stream_opt < 0 || stream_opt > 2)
+        goto err;
+
+    if ((accept_flags & SSL_ACCEPT_STREAM_UNI)
+        && !(accept_flags & SSL_ACCEPT_STREAM_BIDI))
+        should_accept = create_uni;
+    else if ((accept_flags & SSL_ACCEPT_STREAM_BIDI)
+             && !(accept_flags & SSL_ACCEPT_STREAM_UNI))
+        should_accept = create_bidi;
+
+    if (create_uni
+        && (!TEST_ptr(serverstream = SSL_new_stream(serverssl, SSL_STREAM_FLAG_UNI))
+            || !TEST_int_gt(SSL_write_ex(serverstream, msg, sizeof(msg), &nwritten), 0)
+            || !TEST_size_t_eq(nwritten, sizeof(msg))
+            || !TEST_int_eq(SSL_handle_events(clientssl), 1)))
+        goto err;
+
+    if (create_bidi
+        && (!TEST_ptr(serverstream2 = SSL_new_stream(serverssl, 0))
+            || !TEST_int_gt(SSL_write_ex(serverstream2, msg, sizeof(msg), &nwritten), 0)
+            || !TEST_size_t_eq(nwritten, sizeof(msg))
+            || !TEST_int_eq(SSL_handle_events(clientssl), 1)))
+        goto err;
+
+    clientstream = SSL_accept_stream(clientssl, accept_flags);
+    if (should_accept && clientstream == NULL) {
+        TEST_info("Should have accepted stream but did not");
+        goto err;
+    } else if (!should_accept && clientstream != NULL) {
+        TEST_info("Should not have accepted stream but did");
+        goto err;
+    } else if (!should_accept && clientstream == NULL) {
+        ret = 1;
+        goto err;
+    }
+
+    stream_type = SSL_get_stream_type(clientstream);
+    if (!create_uni && create_bidi && stream_type != SSL_STREAM_TYPE_BIDI)
+        goto err;
+    else if (create_uni && !create_bidi && stream_type != SSL_STREAM_TYPE_READ)
+        goto err;
+
+    if (!TEST_int_gt(SSL_read_ex(clientstream, buf, sizeof(buf), &nread), 0)
+        || !TEST_size_t_eq(nread, sizeof(msg)))
+        goto err;
+
+    ret = 1;
+err:
+    SSL_free(serverstream);
+    SSL_free(serverstream2);
+    SSL_free(clientstream);
+
+    /* In case there are still streams still in the queue (up to 2) */
+    clientstream = SSL_accept_stream(clientssl, 0);
+    SSL_free(clientstream);
+    clientstream = SSL_accept_stream(clientssl, 0);
+    SSL_free(clientstream);
+
+    return ret;
+}
+
+static int test_accept_stream(void)
+{
+    SSL_CTX *cctx = NULL, *sctx = NULL;
+    SSL *clientssl = NULL, *serverssl = NULL, *qlistener = NULL;
+    int testresult = 0;
+    int ret, i;
+    long unsigned int j;
+    uint64_t accept_flags[] = {
+        0,
+        SSL_ACCEPT_STREAM_UNI,
+        SSL_ACCEPT_STREAM_BIDI,
+        SSL_ACCEPT_STREAM_UNI | SSL_ACCEPT_STREAM_BIDI
+    };
+
+    if (!TEST_ptr(sctx = create_server_ctx())
+        || !TEST_ptr(cctx = create_client_ctx())
+        || !create_quic_ssl_objects(sctx, cctx, &qlistener, &clientssl))
+        goto err;
+
+    /* Calling SSL_accept() on a listener is expected to fail */
+    ret = SSL_accept(qlistener);
+    if (!TEST_int_le(ret, 0)
+        || !TEST_int_eq(SSL_get_error(qlistener, ret), SSL_ERROR_SSL))
+        goto err;
+
+    /* Send ClientHello and server retry */
+    for (i = 0; i < 2; i++) {
+        ret = SSL_connect(clientssl);
+        if (!TEST_int_le(ret, 0)
+            || !TEST_int_eq(SSL_get_error(clientssl, ret), SSL_ERROR_WANT_READ))
+            goto err;
+        SSL_handle_events(qlistener);
+    }
+
+    /* We expect a server SSL object which has not yet completed its handshake */
+    serverssl = SSL_accept_connection(qlistener, 0);
+    if (!TEST_ptr(serverssl) || !TEST_false(SSL_is_init_finished(serverssl)))
+        goto err;
+
+    /* Call SSL_accept() and SSL_connect() until we are connected */
+    if (!TEST_true(create_bare_ssl_connection(serverssl, clientssl,
+                                              SSL_ERROR_NONE, 0, 0)))
+        goto err;
+
+    if (!TEST_int_eq(SSL_set_default_stream_mode(clientssl,
+                                                 SSL_DEFAULT_STREAM_MODE_NONE), 1)
+        || !TEST_int_eq(SSL_set_default_stream_mode(serverssl,
+                                                    SSL_DEFAULT_STREAM_MODE_NONE), 1)
+        || !TEST_int_eq(SSL_set_incoming_stream_policy(clientssl,
+                                                       SSL_INCOMING_STREAM_POLICY_ACCEPT,
+                                                       0), 1)
+        || !TEST_int_eq(SSL_set_incoming_stream_policy(serverssl,
+                                                       SSL_INCOMING_STREAM_POLICY_ACCEPT,
+                                                       0), 1))
+        goto err;
+
+    for (j = 0; j < sizeof(accept_flags) / sizeof(accept_flags[0]); j++) {
+        if (!TEST_int_eq(create_accept_stream(serverssl, clientssl,
+                                              accept_flags[j], 0), 1)
+            || !TEST_int_eq(create_accept_stream(serverssl, clientssl,
+                                                 accept_flags[j], 1), 1)
+            || !TEST_int_eq(create_accept_stream(serverssl, clientssl,
+                                                 accept_flags[j], 2), 1)
+            )
+            goto err;
+    }
+
+    testresult = 1;
+ err:
+    SSL_free(serverssl);
+    SSL_free(clientssl);
+    SSL_free(qlistener);
+    SSL_CTX_free(sctx);
+    SSL_CTX_free(cctx);
+
+    return testresult;
+}
+
+/*
+ * When the server has a different primary group than the client, the server
+ * should not fail on the client hello retry.
+ */
+static int test_client_hello_retry(void)
+{
+#if !defined(OPENSSL_NO_EC) && !defined(OPENSSL_NO_ECX)
+    SSL_CTX *cctx = NULL, *sctx = NULL;
+    SSL *clientssl = NULL, *serverssl = NULL, *qlistener = NULL;
+    int testresult = 0, i = 0, ret = 0;
+
+    if (!TEST_ptr(sctx = create_server_ctx())
+        || !TEST_ptr(cctx = create_client_ctx()))
+        goto err;
+    /*
+     * set the specific groups for the test
+     */
+    if (!TEST_true(SSL_CTX_set1_groups_list(cctx, "secp384r1:secp256r1")))
+        goto err;
+    if (!TEST_true(SSL_CTX_set1_groups_list(sctx, "secp256r1")))
+        goto err;
+
+    if (!create_quic_ssl_objects(sctx, cctx, &qlistener, &clientssl))
+        goto err;
+
+    /* Send ClientHello and server retry */
+    for (i = 0; i < 2; i++) {
+        ret = SSL_connect(clientssl);
+        if (!TEST_int_le(ret, 0)
+            || !TEST_int_eq(SSL_get_error(clientssl, ret), SSL_ERROR_WANT_READ))
+            goto err;
+        SSL_handle_events(qlistener);
+    }
+
+    /* We expect a server SSL object which has not yet completed its handshake */
+    serverssl = SSL_accept_connection(qlistener, 0);
+
+    /* Call SSL_accept() and SSL_connect() until we are connected */
+    if (!TEST_true(create_bare_ssl_connection(serverssl, clientssl,
+                                              SSL_ERROR_NONE, 0, 0)))
+        goto err;
+
+    testresult = 1;
+
+err:
+    SSL_CTX_free(cctx);
+    SSL_CTX_free(sctx);
+    SSL_free(clientssl);
+    SSL_free(serverssl);
+    SSL_free(qlistener);
+
+    return testresult;
+#else
+    return TEST_skip("EC(X) keys are not supported in this build");
+#endif
+}
+
+/***********************************************************************************/
 OPT_TEST_DECLARE_USAGE("provider config certsdir datadir\n")
 
 int setup_tests(void)
@@ -2349,7 +3167,17 @@ int setup_tests(void)
     ADD_TEST(test_get_shutdown);
     ADD_ALL_TESTS(test_tparam, OSSL_NELEM(tparam_tests));
     ADD_TEST(test_session_cb);
-
+    ADD_TEST(test_domain_flags);
+    ADD_TEST(test_early_ticks);
+    ADD_TEST(test_ssl_new_from_listener);
+#ifndef OPENSSL_NO_SSL_TRACE
+    ADD_TEST(test_new_token);
+#endif
+    ADD_TEST(test_server_method_with_ssl_new);
+    ADD_TEST(test_ssl_accept_connection);
+    ADD_TEST(test_ssl_set_verify);
+    ADD_TEST(test_accept_stream);
+    ADD_TEST(test_client_hello_retry);
     return 1;
  err:
     cleanup_tests();

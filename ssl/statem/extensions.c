@@ -1,5 +1,5 @@
 /*
- * Copyright 2016-2024 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2016-2025 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -15,8 +15,10 @@
 #include <string.h>
 #include "internal/nelem.h"
 #include "internal/cryptlib.h"
+#include "internal/ssl_unwrap.h"
 #include "../ssl_local.h"
 #include "statem_local.h"
+#include <openssl/ocsp.h>
 
 static int final_renegotiate(SSL_CONNECTION *s, unsigned int context, int sent);
 static int init_server_name(SSL_CONNECTION *s, unsigned int context);
@@ -625,7 +627,7 @@ int tls_collect_extensions(SSL_CONNECTION *s, PACKET *packet,
         custom_ext_init(&s->cert->custext);
 
     num_exts = OSSL_NELEM(ext_defs) + (exts != NULL ? exts->meths_count : 0);
-    raw_extensions = OPENSSL_zalloc(num_exts * sizeof(*raw_extensions));
+    raw_extensions = OPENSSL_calloc(num_exts, sizeof(*raw_extensions));
     if (raw_extensions == NULL) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_CRYPTO_LIB);
         return 0;
@@ -655,7 +657,7 @@ int tls_collect_extensions(SSL_CONNECTION *s, PACKET *packet,
             SSLfatal(s, SSL_AD_ILLEGAL_PARAMETER, SSL_R_BAD_EXTENSION);
             goto err;
         }
-        idx = thisex - raw_extensions;
+        idx = (unsigned int)(thisex - raw_extensions);
         /*-
          * Check that we requested this extension (if appropriate). Requests can
          * be sent in the ClientHello and CertificateRequest. Unsolicited
@@ -695,7 +697,7 @@ int tls_collect_extensions(SSL_CONNECTION *s, PACKET *packet,
             if (s->ext.debug_cb)
                 s->ext.debug_cb(SSL_CONNECTION_GET_USER_SSL(s), !s->server,
                                 thisex->type, PACKET_data(&thisex->data),
-                                PACKET_remaining(&thisex->data),
+                                (int)PACKET_remaining(&thisex->data),
                                 s->ext.debug_arg);
         }
     }
@@ -1147,6 +1149,9 @@ static int init_status_request(SSL_CONNECTION *s, unsigned int context)
         OPENSSL_free(s->ext.ocsp.resp);
         s->ext.ocsp.resp = NULL;
         s->ext.ocsp.resp_len = 0;
+
+        sk_OCSP_RESPONSE_pop_free(s->ext.ocsp.resp_ex, OCSP_RESPONSE_free);
+        s->ext.ocsp.resp_ex = NULL;
     }
 
     return 1;
@@ -1448,36 +1453,12 @@ static int final_key_share(SSL_CONNECTION *s, unsigned int context, int sent)
             /* No suitable key_share */
             if (s->hello_retry_request == SSL_HRR_NONE && sent
                     && (!s->hit
-                        || (s->ext.psk_kex_mode & TLSEXT_KEX_MODE_FLAG_KE_DHE)
-                           != 0)) {
-                const uint16_t *pgroups, *clntgroups;
-                size_t num_groups, clnt_num_groups, i;
-                unsigned int group_id = 0;
+                        || (s->ext.psk_kex_mode & TLSEXT_KEX_MODE_FLAG_KE_DHE) != 0)) {
 
-                /* Check if a shared group exists */
-
-                /* Get the clients list of supported groups. */
-                tls1_get_peer_groups(s, &clntgroups, &clnt_num_groups);
-                tls1_get_supported_groups(s, &pgroups, &num_groups);
-
-                /*
-                 * Find the first group we allow that is also in client's list
-                 */
-                for (i = 0; i < num_groups; i++) {
-                    group_id = pgroups[i];
-
-                    if (check_in_list(s, group_id, clntgroups, clnt_num_groups,
-                                      1)
-                            && tls_group_allowed(s, group_id,
-                                                 SSL_SECOP_CURVE_SUPPORTED)
-                            && tls_valid_group(s, group_id, TLS1_3_VERSION,
-                                               TLS1_3_VERSION, 0, NULL))
-                        break;
-                }
-
-                if (i < num_groups) {
+                /* Did we detect group overlap in tls_parse_ctos_key_share ? */
+                if (s->s3.group_id_candidate != 0) {
                     /* A shared group exists so send a HelloRetryRequest */
-                    s->s3.group_id = group_id;
+                    s->s3.group_id = s->s3.group_id_candidate;
                     s->hello_retry_request = SSL_HRR_PENDING;
                     return 1;
                 }
@@ -1759,11 +1740,14 @@ static int final_early_data(SSL_CONNECTION *s, unsigned int context, int sent)
 static int final_maxfragmentlen(SSL_CONNECTION *s, unsigned int context,
                                 int sent)
 {
+    if (s->session == NULL)
+        return 1;
+
     /* MaxFragmentLength defaults to disabled */
     if (s->session->ext.max_fragment_len_mode == TLSEXT_max_fragment_length_UNSPECIFIED)
         s->session->ext.max_fragment_len_mode = TLSEXT_max_fragment_length_DISABLED;
 
-    if (s->session && USE_MAX_FRAGMENT_LENGTH_EXT(s->session)) {
+    if (USE_MAX_FRAGMENT_LENGTH_EXT(s->session)) {
         s->rlayer.rrlmethod->set_max_frag_len(s->rlayer.rrl,
                                               GET_MAX_FRAGMENT_LENGTH(s->session));
         s->rlayer.wrlmethod->set_max_frag_len(s->rlayer.wrl,
@@ -1919,6 +1903,10 @@ int tls_parse_compress_certificate(SSL_CONNECTION *sc, PACKET *pkt, unsigned int
             sc->ext.compress_certificate_from_peer[j++] = comp;
             already_set[comp] = 1;
         }
+    }
+    if (PACKET_remaining(&supported_comp_algs) != 0) {
+        SSLfatal(sc, SSL_AD_DECODE_ERROR, SSL_R_BAD_EXTENSION);
+        return 0;
     }
 #endif
     return 1;

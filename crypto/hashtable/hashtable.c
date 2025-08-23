@@ -1,5 +1,5 @@
 /*
- * Copyright 2024 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2024-2025 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -53,6 +53,7 @@
 #include <string.h>
 #include <internal/rcu.h>
 #include <internal/hashtable.h>
+#include <internal/hashfunc.h>
 #include <openssl/rand.h>
 
 /*
@@ -85,18 +86,6 @@
 # define PREFETCH_NEIGHBORHOOD(x)
 # define PREFETCH(x)
 #endif
-
-static ossl_unused uint64_t fnv1a_hash(uint8_t *key, size_t len)
-{
-    uint64_t hash = 0xcbf29ce484222325ULL;
-    size_t i;
-
-    for (i = 0; i < len; i++) {
-        hash ^= key[i];
-        hash *= 0x00000100000001B3ULL;
-    }
-    return hash;
-}
 
 /*
  * Define our neighborhood list length
@@ -165,12 +154,13 @@ static struct ht_neighborhood_st *alloc_new_neighborhood_list(size_t len,
 {
     struct ht_neighborhood_st *ret;
 
-    ret = OPENSSL_aligned_alloc(sizeof(struct ht_neighborhood_st) * len,
-                                CACHE_LINE_BYTES, freeptr);
+    ret = OPENSSL_aligned_alloc_array(len, sizeof(struct ht_neighborhood_st),
+                                      CACHE_LINE_BYTES, freeptr);
 
     /* fall back to regular malloc */
     if (ret == NULL) {
-        ret = *freeptr = OPENSSL_malloc(sizeof(struct ht_neighborhood_st) * len);
+        ret = *freeptr =
+            OPENSSL_malloc_array(len, sizeof(struct ht_neighborhood_st));
         if (ret == NULL)
             return NULL;
     }
@@ -229,7 +219,7 @@ HT *ossl_ht_new(const HT_CONFIG *conf)
         goto err;
 
     if (new->config.ht_hash_fn == NULL)
-        new->config.ht_hash_fn = fnv1a_hash;
+        new->config.ht_hash_fn = ossl_fnv1a_hash;
 
     return new;
 
@@ -243,9 +233,9 @@ err:
     return NULL;
 }
 
-void ossl_ht_read_lock(HT *htable)
+int ossl_ht_read_lock(HT *htable)
 {
-    ossl_rcu_read_lock(htable->lock);
+    return ossl_rcu_read_lock(htable->lock);
 }
 
 void ossl_ht_read_unlock(HT *htable)
@@ -646,6 +636,7 @@ int ossl_ht_insert(HT *h, HT_KEY *key, HT_VALUE *data, HT_VALUE **olddata)
     if (data->value == NULL)
         goto out;
 
+    rc = -1;
     newval = alloc_new_value(h, key, data->value, data->type_id);
     if (newval == NULL)
         goto out;

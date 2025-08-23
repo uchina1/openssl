@@ -1,5 +1,5 @@
 /*
- * Copyright 2022-2023 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2022-2025 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -39,7 +39,7 @@ static int encode_case_1_dec(PACKET *pkt, ossl_ssize_t fail)
         /* No failure modes for padding */
         return 1;
 
-    if (!TEST_int_eq(ossl_quic_wire_decode_padding(pkt), 3))
+    if (!TEST_size_t_eq(ossl_quic_wire_decode_padding(pkt), 3))
         return 0;
 
     return 1;
@@ -1542,7 +1542,7 @@ static int test_wire_retry_integrity_tag(void)
     if (!TEST_true(PACKET_buf_init(&pkt, retry_encoded, sizeof(retry_encoded))))
         goto err;
 
-    if (!TEST_true(ossl_quic_wire_decode_pkt_hdr(&pkt, 0, 0, 0, &hdr, NULL)))
+    if (!TEST_true(ossl_quic_wire_decode_pkt_hdr(&pkt, 0, 0, 0, &hdr, NULL, NULL)))
         goto err;
 
     if (!TEST_int_eq(hdr.type, QUIC_PKT_TYPE_RETRY))

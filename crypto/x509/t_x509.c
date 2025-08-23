@@ -1,11 +1,16 @@
 /*
- * Copyright 1995-2022 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 1995-2025 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
  * in the file LICENSE in the source distribution or at
  * https://www.openssl.org/source/license.html
  */
+
+/*
+ * because of EVP_PKEY_asn1_find deprecation
+ */
+#define OPENSSL_SUPPRESS_DEPRECATED
 
 #include <stdio.h>
 #include "internal/cryptlib.h"
@@ -287,7 +292,9 @@ int X509_signature_dump(BIO *bp, const ASN1_STRING *sig, int indent)
 int X509_signature_print(BIO *bp, const X509_ALGOR *sigalg,
                          const ASN1_STRING *sig)
 {
+#ifndef OPENSSL_NO_DEPRECATED_3_6
     int sig_nid;
+#endif
     int indent = 4;
     if (BIO_printf(bp, "%*sSignature Algorithm: ", indent, "") <= 0)
         return 0;
@@ -296,6 +303,7 @@ int X509_signature_print(BIO *bp, const X509_ALGOR *sigalg,
 
     if (sig && BIO_printf(bp, "\n%*sSignature Value:", indent, "") <= 0)
         return 0;
+#ifndef OPENSSL_NO_DEPRECATED_3_6
     sig_nid = OBJ_obj2nid(sigalg->algorithm);
     if (sig_nid != NID_undef) {
         int pkey_nid, dig_nid;
@@ -306,6 +314,7 @@ int X509_signature_print(BIO *bp, const X509_ALGOR *sigalg,
                 return ameth->sig_print(bp, sigalg, sig, indent + 4, 0);
         }
     }
+#endif
     if (BIO_write(bp, "\n", 1) != 1)
         return 0;
     if (sig)
@@ -506,33 +515,36 @@ int X509_STORE_CTX_print_verify_cb(int ok, X509_STORE_CTX *ctx)
 
 /*
  * Prints serial numbers in decimal and hexadecimal. The indent argument is only
- * used if the serial number is too large to fit in a long int.
+ * used if the serial number is too large to fit in an int64_t.
  */
 int ossl_serial_number_print(BIO *out, const ASN1_INTEGER *bs, int indent)
 {
-    int i;
-    long l;
-    unsigned long ul;
+    int i, ok;
+    int64_t l;
+    uint64_t ul;
     const char *neg;
 
-    if (bs->length <= (int)sizeof(long)) {
-        ERR_set_mark();
-        l = ASN1_INTEGER_get(bs);
-        ERR_pop_to_mark();
-    } else {
-        l = -1;
+    if (bs->length == 0) {
+        if (BIO_puts(out, " (Empty)") <= 0)
+            return -1;
+        return 0;
     }
-    if (l != -1) { /* Reading a long int succeeded: print decimal and hex. */
+
+    ERR_set_mark();
+    ok = ASN1_INTEGER_get_int64(&l, bs);
+    ERR_pop_to_mark();
+
+    if (ok) { /* Reading an int64_t succeeded: print decimal and hex. */
         if (bs->type == V_ASN1_NEG_INTEGER) {
-            ul = 0 - (unsigned long)l;
+            ul = 0 - (uint64_t)l;
             neg = "-";
         } else {
             ul = l;
             neg = "";
         }
-        if (BIO_printf(out, " %s%lu (%s0x%lx)", neg, ul, neg, ul) <= 0)
+        if (BIO_printf(out, " %s%ju (%s0x%jx)", neg, ul, neg, ul) <= 0)
             return -1;
-    } else { /* Reading a long int failed: just print hex. */
+    } else { /* Reading an int64_t failed: just print hex. */
         neg = (bs->type == V_ASN1_NEG_INTEGER) ? " (Negative)" : "";
         if (BIO_printf(out, "\n%*s%s", indent, "", neg) <= 0)
             return -1;

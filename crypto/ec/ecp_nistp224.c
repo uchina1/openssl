@@ -1264,7 +1264,7 @@ void EC_nistp224_pre_comp_free(NISTP224_PRE_COMP *p)
         return;
 
     CRYPTO_DOWN_REF(&p->references, &i);
-    REF_PRINT_COUNT("EC_nistp224", p);
+    REF_PRINT_COUNT("EC_nistp224", i, p);
     if (i > 0)
         return;
     REF_ASSERT_ISNT(i < 0);
@@ -1475,11 +1475,11 @@ int ossl_ec_GFp_nistp224_points_mul(const EC_GROUP *group, EC_POINT *r,
              */
             mixed = 1;
         }
-        secrets = OPENSSL_zalloc(sizeof(*secrets) * num_points);
-        pre_comp = OPENSSL_zalloc(sizeof(*pre_comp) * num_points);
+        secrets = OPENSSL_calloc(num_points, sizeof(*secrets));
+        pre_comp = OPENSSL_calloc(num_points, sizeof(*pre_comp));
         if (mixed)
             tmp_felems =
-                OPENSSL_malloc(sizeof(felem) * (num_points * 17 + 1));
+                OPENSSL_malloc_array(num_points * 17 + 1, sizeof(felem));
         if ((secrets == NULL) || (pre_comp == NULL)
             || (mixed && (tmp_felems == NULL)))
             goto err;

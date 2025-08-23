@@ -1,5 +1,5 @@
 /*
- * Copyright 2008-2021 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2008-2025 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -1144,8 +1144,8 @@ static char *wide_to_asc(LPCWSTR wstr)
     len_1 = wcslen(wstr) + 1;
 
     if (len_1 > INT_MAX) {
-	    CAPIerr(CAPI_F_WIDE_TO_ASC, CAPI_R_FUNCTION_NOT_SUPPORTED);
-	    return NULL;
+        CAPIerr(CAPI_F_WIDE_TO_ASC, CAPI_R_FUNCTION_NOT_SUPPORTED);
+        return NULL;
     }
 
     len_0 = (int)len_1; /* WideCharToMultiByte expects int */
@@ -1771,7 +1771,10 @@ static int capi_load_ssl_client_cert(ENGINE *e, SSL *ssl,
             if (!certs)
                 certs = sk_X509_new_null();
 
-            sk_X509_push(certs, x);
+            if (!sk_X509_push(certs, x)) {
+                X509_free(x);
+                continue;
+            }
         } else {
             X509_free(x);
         }

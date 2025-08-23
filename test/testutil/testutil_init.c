@@ -39,7 +39,9 @@ static size_t internal_trace_cb(const char *buf, size_t cnt,
         BIO_set_prefix(trace_data->bio, buffer);
         break;
     case OSSL_TRACE_CTRL_WRITE:
-        ret = BIO_write(trace_data->bio, buf, cnt);
+        if (cnt > INT_MAX)
+            cnt = INT_MAX;
+        ret = BIO_write(trace_data->bio, buf, (int)cnt);
         break;
     case OSSL_TRACE_CTRL_END:
         trace_data->ingroup = 0;
@@ -92,6 +94,7 @@ static void setup_trace_category(int category)
                 "warning: unable to setup trace callback for category '%s'.\n",
                 OSSL_trace_get_category_name(category));
 
+        OPENSSL_free(trace_data);
         OSSL_trace_set_callback(category, NULL, NULL);
         BIO_free_all(channel);
     }

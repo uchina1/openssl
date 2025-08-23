@@ -42,9 +42,13 @@ static void le_copy(unsigned char *out, size_t outlen,
     if (IS_LITTLE_ENDIAN) {
         memcpy(out, in, outlen);
     } else {
-        if (outlen < inlen)
+        if (outlen < inlen) {
             in = (const char *)in + inlen - outlen;
-        swap_copy(out, in, outlen);
+            inlen = outlen;
+        }
+        if (!ossl_assert(outlen <= inlen))
+            return;
+        swap_copy(out, in, inlen);
     }
 }
 
@@ -597,7 +601,7 @@ static int test_param_construct(int tstid)
     OSSL_PARAM params[20];
     char buf[100], buf2[100], *bufp, *bufp2;
     unsigned char ubuf[100];
-    void *vp, *vpn = NULL, *vp2;
+    void *vp, *vp2, *vpn = NULL, *vpn2 = NULL;
     OSSL_PARAM *cp;
     int i, n = 0, ret = 0;
     unsigned int u;
@@ -624,8 +628,10 @@ static int test_param_construct(int tstid)
     params[n++] = OSSL_PARAM_construct_BN("bignum", ubuf, sizeof(ubuf));
     params[n++] = OSSL_PARAM_construct_utf8_string("utf8str", buf, sizeof(buf));
     params[n++] = OSSL_PARAM_construct_octet_string("octstr", buf, sizeof(buf));
+    params[n++] = OSSL_PARAM_construct_octet_string("octstr2", buf, sizeof(buf));
     params[n++] = OSSL_PARAM_construct_utf8_ptr("utf8ptr", &bufp, 0);
     params[n++] = OSSL_PARAM_construct_octet_ptr("octptr", &vp, 0);
+    params[n++] = OSSL_PARAM_construct_octet_ptr("octptr2", &vp, 0);
     params[n] = OSSL_PARAM_construct_end();
 
     switch (tstid) {
@@ -722,10 +728,44 @@ static int test_param_construct(int tstid)
         || !TEST_mem_eq(vp, sizeof("abcdefghi"),
                         "abcdefghi", sizeof("abcdefghi")))
         goto err;
+    /* OCTET string using OSSL_PARAM_set_octet_string_or_ptr */
+    if (!TEST_ptr(cp = OSSL_PARAM_locate(p, "octstr2"))
+        || !TEST_true(OSSL_PARAM_set_octet_string_or_ptr(cp, "jklmnopqr",
+                                                         sizeof("jklmnopqr")))
+        || !TEST_size_t_eq(cp->return_size, sizeof("jklmnopqr")))
+        goto err;
+    /* Match the return size to avoid trailing garbage bytes */
+    cp->data_size = cp->return_size;
+    if (!TEST_true(OSSL_PARAM_get_octet_string(cp, &vpn2, 0, &s))
+        || !TEST_size_t_eq(s, sizeof("jklmnopqr"))
+        || !TEST_mem_eq(vpn2, sizeof("jklmnopqr"),
+                        "jklmnopqr", sizeof("jklmnopqr")))
+        goto err;
+    vp = buf2;
+    if (!TEST_true(OSSL_PARAM_get_octet_string(cp, &vp, sizeof(buf2), &s))
+        || !TEST_size_t_eq(s, sizeof("jklmnopqr"))
+        || !TEST_mem_eq(vp, sizeof("jklmnopqr"),
+                        "jklmnopqr", sizeof("jklmnopqr")))
+        goto err;
     /* OCTET pointer */
     vp = &l;
     if (!TEST_ptr(cp = OSSL_PARAM_locate(p, "octptr"))
         || !TEST_true(OSSL_PARAM_set_octet_ptr(cp, &ul, sizeof(ul)))
+        || !TEST_size_t_eq(cp->return_size, sizeof(ul))
+        || (tstid <= 1 && !TEST_ptr_eq(vp, &ul)))
+        goto err;
+    /* Match the return size to avoid trailing garbage bytes */
+    cp->data_size = cp->return_size;
+    if (!TEST_true(OSSL_PARAM_get_octet_ptr(cp, (const void **)&vp2, &k))
+        || !TEST_size_t_eq(k, sizeof(ul))
+        || (tstid <= 1 && !TEST_ptr_eq(vp2, vp)))
+        goto err;
+    /* OCTET pointer using OSSL_PARAM_set_octet_string_or_ptr */
+    vp = &l;
+    vp2 = NULL;
+    k = 0;
+    if (!TEST_ptr(cp = OSSL_PARAM_locate(p, "octptr2"))
+        || !TEST_true(OSSL_PARAM_set_octet_string_or_ptr(cp, &ul, sizeof(ul)))
         || !TEST_size_t_eq(cp->return_size, sizeof(ul))
         || (tstid <= 1 && !TEST_ptr_eq(vp, &ul)))
         goto err;
@@ -752,6 +792,7 @@ err:
         OPENSSL_free(p);
     OPENSSL_free(p1);
     OPENSSL_free(vpn);
+    OPENSSL_free(vpn2);
     BN_free(bn);
     BN_free(bn2);
     return ret;
@@ -815,6 +856,33 @@ static int test_param_copy_null(void)
     OSSL_PARAM_free(cp1);
     return ret;
 }
+static int test_param_merge(void)
+{
+    int val, ret;
+    int values[] = {1, 2, 3, 4};
+    OSSL_PARAM *p = NULL, *cp = NULL;
+    OSSL_PARAM param[3], param1[3];
+
+    param[0] = OSSL_PARAM_construct_int("diff1", &values[0]);
+    param[1] = OSSL_PARAM_construct_int("same", &values[1]);
+    param[2] = OSSL_PARAM_construct_end();
+    param1[0] = OSSL_PARAM_construct_int("diff2", &values[2]);
+    param1[1] = OSSL_PARAM_construct_int("same", &values[3]);
+    param1[2] = OSSL_PARAM_construct_end();
+
+    ret = TEST_ptr(p = OSSL_PARAM_merge(param, param1))
+        && TEST_ptr(cp = OSSL_PARAM_locate(p, "diff1"))
+        && TEST_true(OSSL_PARAM_get_int(p, &val))
+        && TEST_int_eq(val, values[0])
+        && TEST_ptr(cp = OSSL_PARAM_locate(p, "diff2"))
+        && TEST_true(OSSL_PARAM_get_int(cp, &val))
+        && TEST_int_eq(val, values[2])
+        && TEST_ptr(cp = OSSL_PARAM_locate(p, "same"))
+        && TEST_true(OSSL_PARAM_get_int(cp, &val))
+        && TEST_int_eq(val, values[3]);
+    OSSL_PARAM_free(p);
+    return ret;
+}
 
 int setup_tests(void)
 {
@@ -834,5 +902,6 @@ int setup_tests(void)
     ADD_ALL_TESTS(test_param_construct, 4);
     ADD_TEST(test_param_modified);
     ADD_TEST(test_param_copy_null);
+    ADD_TEST(test_param_merge);
     return 1;
 }

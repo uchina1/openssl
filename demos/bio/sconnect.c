@@ -74,14 +74,16 @@ int main(int argc, char *argv[])
 
     /* The BIO has parsed the host:port and even IPv6 literals in [] */
     hostname = BIO_get_conn_hostname(out);
-    if (!hostname || SSL_set1_host(ssl, hostname) <= 0)
+    if (!hostname || SSL_set1_host(ssl, hostname) <= 0) {
+        BIO_free(ssl_bio);
         goto err;
+    }
 
     BIO_set_nbio(out, 1);
     out = BIO_push(ssl_bio, out);
 
     p = "GET / HTTP/1.0\r\n\r\n";
-    len = strlen(p);
+    len = (int)strlen(p);
 
     off = 0;
     for (;;) {

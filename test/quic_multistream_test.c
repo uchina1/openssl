@@ -1,5 +1,5 @@
 /*
- * Copyright 2023-2024 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2023-2025 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -24,6 +24,16 @@
 #include "internal/numbers.h"  /* UINT64_C */
 
 static const char *certfile, *keyfile;
+
+#if defined(_AIX)
+/*
+ * Some versions of AIX define macros for events and revents for use when
+ * accessing pollfd structures (see Github issue #24236). That interferes
+ * with our use of these names here. We simply undef them.
+ */
+# undef revents
+# undef events
+#endif
 
 #if defined(OPENSSL_THREADS)
 struct child_thread_args {
@@ -72,8 +82,8 @@ struct helper {
 #if defined(OPENSSL_THREADS)
     struct child_thread_args    *threads;
     size_t                      num_threads;
-    CRYPTO_MUTEX		*misc_m;
-    CRYPTO_CONDVAR		*misc_cv;
+    CRYPTO_MUTEX                *misc_m;
+    CRYPTO_CONDVAR              *misc_cv;
 #endif
 
     OSSL_TIME       start_time;
@@ -188,6 +198,7 @@ struct script_op {
 #define OPK_C_WRITE_EX2                             52
 #define OPK_SKIP_IF_BLOCKING                        53
 #define OPK_C_STREAM_RESET_FAIL                     54
+#define OPK_C_SHUTDOWN                              55
 
 #define EXPECT_CONN_CLOSE_APP       (1U << 0)
 #define EXPECT_CONN_CLOSE_REMOTE    (1U << 1)
@@ -260,6 +271,8 @@ struct script_op {
     {OPK_C_SET_DEFAULT_STREAM_MODE, NULL, (mode), NULL, NULL},
 #define OP_C_SET_INCOMING_STREAM_POLICY(policy) \
     {OPK_C_SET_INCOMING_STREAM_POLICY, NULL, (policy), NULL, NULL},
+#define OP_C_SHUTDOWN(reason, flags) \
+    {OPK_C_SHUTDOWN, (reason), (flags), NULL, NULL},
 #define OP_C_SHUTDOWN_WAIT(reason, flags) \
     {OPK_C_SHUTDOWN_WAIT, (reason), (flags), NULL, NULL},
 #define OP_C_EXPECT_CONN_CLOSE_INFO(ec, app, remote)                \
@@ -681,6 +694,7 @@ static int helper_init(struct helper *h, const char *script_name,
     QUIC_TSERVER_ARGS s_args = {0};
     union BIO_sock_info_u info;
     char title[128];
+    QTEST_DATA *bdata = NULL;
 
     memset(h, 0, sizeof(*h));
     h->c_fd = -1;
@@ -689,6 +703,10 @@ static int helper_init(struct helper *h, const char *script_name,
     h->blocking = blocking;
     h->need_injector = need_injector;
     h->time_slip = ossl_time_zero();
+
+    bdata = OPENSSL_zalloc(sizeof(QTEST_DATA));
+    if (bdata == NULL)
+        goto err;
 
     if (!TEST_ptr(h->time_lock = CRYPTO_THREAD_lock_new()))
         goto err;
@@ -763,8 +781,9 @@ static int helper_init(struct helper *h, const char *script_name,
         h->qtf = qtest_create_injector(h->s_priv);
         if (!TEST_ptr(h->qtf))
             goto err;
-
-        BIO_set_data(h->s_qtf_wbio, h->qtf);
+        bdata->fault = h->qtf;
+        BIO_set_data(h->s_qtf_wbio, bdata);
+        bdata = NULL;
     }
 
     h->s_net_bio_own = NULL;
@@ -795,7 +814,7 @@ static int helper_init(struct helper *h, const char *script_name,
         goto err;
 
     /* Use custom time function for virtual time skip. */
-    if (!TEST_true(ossl_quic_conn_set_override_now_cb(h->c_conn, get_time, h)))
+    if (!TEST_true(ossl_quic_set_override_now_cb(h->c_conn, get_time, h)))
         goto err;
 
     /* Takes ownership of our reference to the BIO. */
@@ -840,6 +859,7 @@ static int helper_init(struct helper *h, const char *script_name,
     return 1;
 
 err:
+    OPENSSL_free(bdata);
     helper_cleanup(h);
     return 0;
 }
@@ -1256,7 +1276,7 @@ static int run_script_worker(struct helper *h, const struct script_op *script,
 
                 /* 0 is the success case for SSL_set_alpn_protos(). */
                 if (!TEST_false(SSL_set_alpn_protos(h->c_conn, tmp_buf,
-                                                    alpn_len + 1)))
+                                                    (unsigned int)(alpn_len + 1))))
                     goto out;
 
                 OPENSSL_free(tmp_buf);
@@ -1625,7 +1645,7 @@ static int run_script_worker(struct helper *h, const struct script_op *script,
                 if (!TEST_ptr(c_tgt))
                     goto out;
 
-                if (!TEST_true(SSL_set_default_stream_mode(c_tgt, op->arg1)))
+                if (!TEST_true(SSL_set_default_stream_mode(c_tgt, (uint32_t)op->arg1)))
                     goto out;
             }
             break;
@@ -1636,7 +1656,26 @@ static int run_script_worker(struct helper *h, const struct script_op *script,
                     goto out;
 
                 if (!TEST_true(SSL_set_incoming_stream_policy(c_tgt,
-                                                              op->arg1, 0)))
+                                                              (int)op->arg1, 0)))
+                    goto out;
+            }
+            break;
+
+        case OPK_C_SHUTDOWN:
+            {
+                int ret;
+                QUIC_CHANNEL *ch = ossl_quic_conn_get_channel(h->c_conn);
+                SSL_SHUTDOWN_EX_ARGS args = {0};
+
+                ossl_quic_engine_set_inhibit_tick(ossl_quic_channel_get0_engine(ch), 0);
+
+                if (!TEST_ptr(c_tgt))
+                    goto out;
+
+                args.quic_reason = (const char *)op->arg0;
+
+                ret = SSL_shutdown_ex(c_tgt, op->arg1, &args, sizeof(args));
+                if (!TEST_int_ge(ret, 0))
                     goto out;
             }
             break;
@@ -1869,7 +1908,7 @@ static int run_script_worker(struct helper *h, const struct script_op *script,
                     goto out;
                 }
 
-                h->threads = OPENSSL_zalloc(op->arg1 * sizeof(struct child_thread_args));
+                h->threads = OPENSSL_calloc(op->arg1, sizeof(struct child_thread_args));
                 if (!TEST_ptr(h->threads))
                     goto out;
 
@@ -1879,7 +1918,7 @@ static int run_script_worker(struct helper *h, const struct script_op *script,
                     h->threads[i].h            = h;
                     h->threads[i].script       = op->arg0;
                     h->threads[i].script_name  = script_name;
-                    h->threads[i].thread_idx   = i;
+                    h->threads[i].thread_idx   = (int)i;
 
                     h->threads[i].m = ossl_crypto_mutex_new();
                     if (!TEST_ptr(h->threads[i].m))
@@ -1983,7 +2022,7 @@ static int run_script_worker(struct helper *h, const struct script_op *script,
                 QUIC_CHANNEL *ch = ossl_quic_conn_get_channel(h->c_conn);
 
                 ossl_quic_engine_set_inhibit_tick(ossl_quic_channel_get0_engine(ch),
-                                                  op->arg1);
+                                                  (int)op->arg1);
             }
             break;
 
@@ -2822,7 +2861,7 @@ static int script_21_inject_plain(struct helper *h, QUIC_PKT_HDR *hdr,
 {
     int ok = 0;
     WPACKET wpkt;
-    unsigned char frame_buf[8];
+    unsigned char frame_buf[21];
     size_t written;
 
     if (h->inject_word0 == 0 || hdr->type != h->inject_word0)
@@ -2834,6 +2873,94 @@ static int script_21_inject_plain(struct helper *h, QUIC_PKT_HDR *hdr,
 
     if (!TEST_true(WPACKET_quic_write_vlint(&wpkt, h->inject_word1)))
         goto err;
+
+    switch (h->inject_word1) {
+    case OSSL_QUIC_FRAME_TYPE_PATH_CHALLENGE:
+    case OSSL_QUIC_FRAME_TYPE_PATH_RESPONSE:
+    case OSSL_QUIC_FRAME_TYPE_RETIRE_CONN_ID:
+        /*
+         * These cases to be formatted properly need a single uint64_t
+         */
+        if (!TEST_true(WPACKET_put_bytes_u64(&wpkt, (uint64_t)0)))
+            goto err;
+        break;
+    case OSSL_QUIC_FRAME_TYPE_MAX_DATA:
+    case OSSL_QUIC_FRAME_TYPE_STREAMS_BLOCKED_UNI:
+    case OSSL_QUIC_FRAME_TYPE_STREAMS_BLOCKED_BIDI:
+    case OSSL_QUIC_FRAME_TYPE_MAX_STREAMS_BIDI:
+    case OSSL_QUIC_FRAME_TYPE_MAX_STREAMS_UNI:
+    case OSSL_QUIC_FRAME_TYPE_DATA_BLOCKED:
+        /*
+         * These cases require a single vlint
+         */
+        if (!TEST_true(WPACKET_quic_write_vlint(&wpkt, (uint64_t)0)))
+            goto err;
+        break;
+    case OSSL_QUIC_FRAME_TYPE_STOP_SENDING:
+    case OSSL_QUIC_FRAME_TYPE_MAX_STREAM_DATA:
+    case OSSL_QUIC_FRAME_TYPE_STREAM_DATA_BLOCKED:
+        /*
+         * These cases require 2 variable integers
+         */
+        if (!TEST_true(WPACKET_quic_write_vlint(&wpkt, (uint64_t)0)))
+            goto err;
+        if (!TEST_true(WPACKET_quic_write_vlint(&wpkt, (uint64_t)0)))
+            goto err;
+        break;
+    case OSSL_QUIC_FRAME_TYPE_STREAM:
+    case OSSL_QUIC_FRAME_TYPE_RESET_STREAM:
+    case OSSL_QUIC_FRAME_TYPE_CONN_CLOSE_APP:
+        /*
+         * These cases require 3 variable integers
+         */
+        if (!TEST_true(WPACKET_quic_write_vlint(&wpkt, (uint64_t)0)))
+            goto err;
+        if (!TEST_true(WPACKET_quic_write_vlint(&wpkt, (uint64_t)0)))
+            goto err;
+        if (!TEST_true(WPACKET_quic_write_vlint(&wpkt, (uint64_t)0)))
+            goto err;
+        break;
+    case OSSL_QUIC_FRAME_TYPE_NEW_TOKEN:
+        /*
+         * Special case for new token
+         */
+
+        /* New token length, cannot be zero */
+        if (!TEST_true(WPACKET_quic_write_vlint(&wpkt, (uint64_t)1)))
+            goto err;
+
+        /* 1 bytes of token data, to match the above length */
+        if (!TEST_true(WPACKET_put_bytes_u8(&wpkt, (uint8_t)0)))
+            goto err;
+        break;
+    case OSSL_QUIC_FRAME_TYPE_NEW_CONN_ID:
+        /*
+         * Special case for New Connection ids, has a combination
+         * of vlints and fixed width values
+         */
+
+        /* seq number */
+        if (!TEST_true(WPACKET_quic_write_vlint(&wpkt, (uint64_t)0)))
+            goto err;
+
+        /* retire prior to */
+        if (!TEST_true(WPACKET_quic_write_vlint(&wpkt, (uint64_t)0)))
+            goto err;
+
+        /* Connection id length, arbitrary at 1 bytes */
+        if (!TEST_true(WPACKET_put_bytes_u8(&wpkt, (uint8_t)1)))
+            goto err;
+
+        /* The connection id, to match the above length */
+        if (!TEST_true(WPACKET_put_bytes_u8(&wpkt, (uint8_t)0)))
+            goto err;
+
+        /* 16 bytes total for the SRT */
+        if (!TEST_true(WPACKET_memset(&wpkt, 0, 16)))
+            goto err;
+
+        break;
+    }
 
     if (!TEST_true(WPACKET_get_total_written(&wpkt, &written)))
         goto err;
@@ -4919,6 +5046,7 @@ static int generate_version_neg(WPACKET *wpkt, uint32_t version)
     QUIC_PKT_HDR hdr = {0};
 
     hdr.type                = QUIC_PKT_TYPE_VERSION_NEG;
+    hdr.version             = 0;
     hdr.fixed               = 1;
     hdr.dst_conn_id.id_len  = 0;
     hdr.src_conn_id.id_len  = 8;
@@ -4980,10 +5108,64 @@ err:
     return rc;
 }
 
-static const struct script_op script_74[] = {
-    OP_S_SET_INJECT_DATAGRAM (server_gen_version_neg)
-    OP_SET_INJECT_WORD       (1, 0)
+static int do_mutation = 0;
+static QUIC_PKT_HDR *hdr_to_free = NULL;
 
+/*
+ * Check packets to transmit, if we have an initial packet
+ * Modify the version number to something incorrect
+ * so that we trigger a version negotiation
+ * Note, this is a use once function, it will only modify the
+ * first INITIAL packet it sees, after which it needs to be
+ * armed again
+ */
+static int script_74_alter_version(const QUIC_PKT_HDR *hdrin,
+                                   const OSSL_QTX_IOVEC *iovecin, size_t numin,
+                                   QUIC_PKT_HDR **hdrout,
+                                   const OSSL_QTX_IOVEC **iovecout,
+                                   size_t *numout,
+                                   void *arg)
+{
+    *hdrout = OPENSSL_memdup(hdrin, sizeof(QUIC_PKT_HDR));
+    *iovecout = iovecin;
+    *numout = numin;
+    hdr_to_free = *hdrout;
+
+    if (do_mutation == 0)
+        return 1;
+    do_mutation = 0;
+
+    if (hdrin->type == QUIC_PKT_TYPE_INITIAL)
+        (*hdrout)->version = 0xdeadbeef;
+    return 1;
+}
+
+static void script_74_finish_mutation(void *arg)
+{
+    OPENSSL_free(hdr_to_free);
+}
+
+/*
+ * Enable the packet mutator for the client channel
+ * So that when we send a Initial packet
+ * We modify the version to be something invalid
+ * to force a version negotiation
+ */
+static int script_74_arm_packet_mutator(struct helper *h,
+                                        struct helper_local *hl)
+{
+    QUIC_CHANNEL *ch = ossl_quic_conn_get_channel(h->c_conn);
+
+    do_mutation = 1;
+    if (!ossl_quic_channel_set_mutator(ch, script_74_alter_version,
+                                       script_74_finish_mutation,
+                                       NULL))
+        return 0;
+    return 1;
+}
+
+static const struct script_op script_74[] = {
+    OP_CHECK                (script_74_arm_packet_mutator, 0)
     OP_C_SET_ALPN            ("ossltest")
     OP_C_CONNECT_WAIT        ()
 
@@ -5289,7 +5471,7 @@ static int check_idle_timeout(struct helper *h, struct helper_local *hl)
 {
     uint64_t v = 0;
 
-    if (!TEST_true(SSL_get_value_uint(h->c_conn, hl->check_op->arg1,
+    if (!TEST_true(SSL_get_value_uint(h->c_conn, (uint32_t)hl->check_op->arg1,
                                       SSL_VALUE_QUIC_IDLE_TIMEOUT,
                                       &v)))
         return 0;
@@ -5482,7 +5664,6 @@ static const struct script_op script_84[] = {
     OP_S_READ_EXPECT        (a, "apple", 5)
     OP_S_WRITE              (a, "orange", 6)
     OP_C_READ_EXPECT        (a, "orange", 6)
-    OP_CHECK2               (check_write_buf_stat, 0, 0)
 
     OP_END
 };
@@ -5492,7 +5673,6 @@ ossl_unused static int script_85_poll(struct helper *h, struct helper_local *hl)
 {
     int ok = 1, ret, expected_ret = 1;
     static const struct timeval timeout = {0};
-    static const struct timeval nz_timeout = {0, 1};
     size_t result_count, expected_result_count = 0;
     SSL_POLL_ITEM items[5] = {0}, *item = items;
     SSL *c_a, *c_b, *c_c, *c_d;
@@ -5530,16 +5710,6 @@ ossl_unused static int script_85_poll(struct helper *h, struct helper_local *hl)
     item->revents = UINT64_MAX;
     ++item;
 
-    /* Non-zero timeout is not supported. */
-    result_count = SIZE_MAX;
-    ERR_set_mark();
-    if (!TEST_false(SSL_poll(items, OSSL_NELEM(items), sizeof(SSL_POLL_ITEM),
-                             &nz_timeout, 0,
-                             &result_count))
-        || !TEST_size_t_eq(result_count, 0))
-        return 0;
-
-    ERR_pop_to_mark();
     result_count = SIZE_MAX;
     ret = SSL_poll(items, OSSL_NELEM(items), sizeof(SSL_POLL_ITEM),
                    &timeout, 0,
@@ -5639,6 +5809,189 @@ static const struct script_op script_85[] = {
     OP_END
 };
 
+#define POLL_FMT "%s%s%s%s%s%s%s%s%s%s%s%s%s"
+#define POLL_PRINTA(_revents_) \
+    (_revents_) & SSL_POLL_EVENT_F ? "SSL_POLL_EVENT_F " : "", \
+    (_revents_) & SSL_POLL_EVENT_EL ? "SSL_POLL_EVENT_EL " : "", \
+    (_revents_) & SSL_POLL_EVENT_EC ? "SSL_POLL_EVENT_EC " : "", \
+    (_revents_) & SSL_POLL_EVENT_ECD ? "SSL_POLL_EVENT_ECD " : "", \
+    (_revents_) & SSL_POLL_EVENT_ER ? "SSL_POLL_EVENT_ER " : "", \
+    (_revents_) & SSL_POLL_EVENT_EW ? "SSL_POLL_EVENT_EW " : "", \
+    (_revents_) & SSL_POLL_EVENT_R ? "SSL_POLL_EVENT_R " : "", \
+    (_revents_) & SSL_POLL_EVENT_W ? "SSL_POLL_EVENT_W " : "", \
+    (_revents_) & SSL_POLL_EVENT_IC ? "SSL_POLL_EVENT_IC " : "", \
+    (_revents_) & SSL_POLL_EVENT_ISB ? "SSL_POLL_EVENT_ISB " : "", \
+    (_revents_) & SSL_POLL_EVENT_ISU ? "SSL_POLL_EVENT_ISU " : "", \
+    (_revents_) & SSL_POLL_EVENT_OSB ? "SSL_POLL_EVENT_OSB " : "", \
+    (_revents_) & SSL_POLL_EVENT_OSU ? "SSL_POLL_EVENT_OSU " : ""
+
+/* 88. Test SSL_poll (lite, non-blocking) */
+ossl_unused static int script_88_poll(struct helper *h, struct helper_local *hl)
+{
+    int ok = 1, ret, expected_ret = 1;
+    static const struct timeval timeout = {0};
+    size_t result_count, processed;
+    SSL_POLL_ITEM items[2] = {0}, *item = items;
+    SSL *c_a;
+    size_t i;
+    uint64_t mode, expected_revents[2] = {0};
+
+    if (!TEST_ptr(c_a = helper_local_get_c_stream(hl, "a")))
+        return 0;
+
+    item->desc    = SSL_as_poll_descriptor(c_a);
+    item->events  = UINT64_MAX;
+    item->revents = UINT64_MAX;
+    ++item;
+
+    item->desc    = SSL_as_poll_descriptor(h->c_conn);
+    item->events  = UINT64_MAX;
+    item->revents = UINT64_MAX;
+    ++item;
+
+    result_count = SIZE_MAX;
+    ret = SSL_poll(items, OSSL_NELEM(items), sizeof(SSL_POLL_ITEM),
+                   &timeout, 0,
+                   &result_count);
+
+    mode = hl->check_op->arg2;
+    switch (mode) {
+    case 0:
+        /* No incoming data yet */
+        expected_revents[0]     = SSL_POLL_EVENT_W;
+        expected_revents[1]     = SSL_POLL_EVENT_OS;
+        break;
+    case 1:
+        /* Expect more events */
+        expected_revents[0]     = SSL_POLL_EVENT_R;
+        expected_revents[1]     = SSL_POLL_EVENT_OS;
+        break;
+    default:
+        return 0;
+    }
+
+    if (!TEST_int_eq(ret, expected_ret))
+        ok = 0;
+
+    /*
+     * Unlike script 85 which always expects all objects
+     * get signaled in single call to SSL_poll() we must
+     * assume here we can get notification for only one.
+     */
+    processed = 0;
+    for (i = 0; i < OSSL_NELEM(items); ++i) {
+        if (items[i].revents == 0)
+            continue;
+
+        processed++;
+        if (!TEST_uint64_t_eq(items[i].revents, expected_revents[i])) {
+            TEST_info("wanted: " POLL_FMT " got: " POLL_FMT,
+                      POLL_PRINTA(expected_revents[i]),
+                      POLL_PRINTA(items[i].revents));
+            TEST_error("mismatch at index %zu in poll results, mode %d",
+                       i, (int)mode);
+            ok = 0;
+        }
+    }
+
+    if (!TEST_size_t_eq(processed, result_count))
+        ok = 0;
+
+    return ok;
+}
+
+ossl_unused static int script_88_poll_conly(struct helper *h, struct helper_local *hl)
+{
+    int ok = 1;
+    static const struct timeval timeout = {0};
+    size_t result_count;
+    SSL_POLL_ITEM items[1] = {0};
+    int done = 0;
+    OSSL_TIME t_limit;
+
+    result_count = SIZE_MAX;
+
+    items[0].desc    = SSL_as_poll_descriptor(h->c_conn);
+    items[0].events  = UINT64_MAX;
+    items[0].revents = UINT64_MAX;
+
+    t_limit = ossl_time_add(ossl_time_now(),
+                            ossl_ticks2time(5 * OSSL_TIME_SECOND));
+    while (done == 0 && ok == 1) {
+        ok = SSL_poll(items, OSSL_NELEM(items), sizeof(SSL_POLL_ITEM),
+                       &timeout, 0,
+                       &result_count);
+
+        if (!TEST_int_eq(ok, 1))
+            continue;
+
+        if (result_count == 0)
+            OSSL_sleep(10);
+
+        TEST_info("received event " POLL_FMT, POLL_PRINTA(items[0].revents));
+
+        if ((items[0].revents & SSL_POLL_EVENT_EC) == SSL_POLL_EVENT_EC)
+            SSL_shutdown(h->c_conn);
+        done =
+            ((items[0].revents & SSL_POLL_EVENT_ECD) == SSL_POLL_EVENT_ECD);
+
+        if (ossl_time_compare(ossl_time_now(), t_limit) == 1) {
+            TEST_error("shutdown time exceeded 5sec");
+            ok = 0;
+        }
+    }
+
+    return ok;
+}
+
+/*
+ * verify SSL_poll() signals SSL_POLL_EVENT_EC event
+ * to notify client it's time to call SSL_shutdown().
+ */
+static const struct script_op script_88[] = {
+    OP_SKIP_IF_BLOCKING     (16)
+    OP_C_SET_ALPN           ("ossltest")
+    OP_C_CONNECT_WAIT       ()
+
+    OP_C_SET_DEFAULT_STREAM_MODE(SSL_DEFAULT_STREAM_MODE_NONE)
+
+    OP_C_NEW_STREAM_BIDI    (a, C_BIDI_ID(0))
+    OP_S_BIND_STREAM_ID     (a, C_BIDI_ID(0))
+
+    /* Check nothing readable yet. */
+    OP_CHECK                (script_88_poll, 0 /* ->arg2 */)
+
+    OP_C_WRITE              (a, "flamingo", 8)
+    OP_C_CONCLUDE           (a)
+
+    /* Send something that will make client sockets readable. */
+    OP_S_READ_EXPECT        (a, "flamingo", 8)
+    OP_S_WRITE              (a, "flamingo", 8)
+    OP_S_CONCLUDE           (a)
+
+    OP_CHECK                (script_88_poll, 1 /* ->arg2 */)
+
+    OP_C_READ_EXPECT        (a, "flamingo", 8)
+
+    /*
+     * client calls non-blocking SSL_shutdown() and gives
+     * server chance to run by calling sleep.
+     */
+    OP_C_SHUTDOWN           (NULL, 0)
+    OP_SLEEP(100)
+
+    /*
+     * Here we call SSL_poll() and handle SSL_POLL_EVENT_EC
+     * and SSL_POLL_EVENT_ECD on connection object. Whenever
+     * _EC event comes we call SSL_shutdown() to keep connection
+     * draining. We keep calling SSL_poll()/SSL_shutdown() until
+     * SSL_poll() signals SSL_POLL_EVENT_ECD to let us know connection
+     * has dried out and con be closed.
+     */
+    OP_CHECK                (script_88_poll_conly, 0)
+
+    OP_END
+};
 /* 86. Event Handling Mode Configuration */
 static int set_event_handling_mode_conn(struct helper *h, struct helper_local *hl)
 {
@@ -5831,7 +6184,8 @@ static const struct script_op *const scripts[] = {
     script_84,
     script_85,
     script_86,
-    script_87
+    script_87,
+    script_88,
 };
 
 static int test_script(int idx)
@@ -5861,6 +6215,7 @@ static int test_script(int idx)
 
     TEST_info("Running script %d (order=%d, blocking=%d)", script_idx + 1,
               free_order, blocking);
+
     return run_script(scripts[script_idx], script_name, free_order, blocking);
 }
 

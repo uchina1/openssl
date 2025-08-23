@@ -25,6 +25,7 @@
 #include "crypto/bn.h"
 #include "crypto/evp.h"
 #include "crypto/rsa.h"
+#include "crypto/sparse_array.h"
 #include "crypto/security_bits.h"
 #include "rsa_local.h"
 
@@ -92,6 +93,10 @@ static RSA *rsa_new_intern(ENGINE *engine, OSSL_LIB_CTX *libctx)
         return NULL;
     }
 
+    ret->blindings_sa = ossl_rsa_alloc_blinding();
+    if (ret->blindings_sa == NULL)
+        goto err;
+
     ret->libctx = libctx;
     ret->meth = RSA_get_default_method();
 #if !defined(OPENSSL_NO_ENGINE) && !defined(FIPS_MODULE)
@@ -141,7 +146,7 @@ void RSA_free(RSA *r)
         return;
 
     CRYPTO_DOWN_REF(&r->references, &i);
-    REF_PRINT_COUNT("RSA", r);
+    REF_PRINT_COUNT("RSA", i, r);
     if (i > 0)
         return;
     REF_ASSERT_ISNT(i < 0);
@@ -181,8 +186,7 @@ void RSA_free(RSA *r)
     RSA_PSS_PARAMS_free(r->pss);
     sk_RSA_PRIME_INFO_pop_free(r->prime_infos, ossl_rsa_multip_info_free);
 #endif
-    BN_BLINDING_free(r->blinding);
-    BN_BLINDING_free(r->mt_blinding);
+    ossl_rsa_free_blinding(r);
     OPENSSL_free(r);
 }
 
@@ -193,7 +197,7 @@ int RSA_up_ref(RSA *r)
     if (CRYPTO_UP_REF(&r->references, &i) <= 0)
         return 0;
 
-    REF_PRINT_COUNT("RSA", r);
+    REF_PRINT_COUNT("RSA", i, r);
     REF_ASSERT_ISNT(i < 2);
     return i > 1 ? 1 : 0;
 }
@@ -1380,4 +1384,5 @@ int EVP_PKEY_CTX_set_rsa_keygen_primes(EVP_PKEY_CTX *ctx, int primes)
 
     return evp_pkey_ctx_set_params_strict(ctx, params);
 }
+
 #endif

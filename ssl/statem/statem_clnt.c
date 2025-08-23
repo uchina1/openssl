@@ -1,5 +1,5 @@
 /*
- * Copyright 1995-2024 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 1995-2025 The OpenSSL Project Authors. All Rights Reserved.
  * Copyright (c) 2002, Oracle and/or its affiliates. All rights reserved
  * Copyright 2005 Nokia. All rights reserved.
  *
@@ -28,6 +28,8 @@
 #include <openssl/param_build.h>
 #include "internal/cryptlib.h"
 #include "internal/comp.h"
+#include "internal/ssl_unwrap.h"
+#include <openssl/ocsp.h>
 
 static MSG_PROCESS_RETURN tls_process_as_hello_retry_request(SSL_CONNECTION *s,
                                                              PACKET *pkt);
@@ -490,7 +492,7 @@ static WRITE_TRAN ossl_statem_client13_write_transition(SSL_CONNECTION *s)
         return WRITE_TRAN_CONTINUE;
 
     case TLS_ST_PENDING_EARLY_DATA_END:
-        if (s->ext.early_data == SSL_EARLY_DATA_ACCEPTED) {
+        if (s->ext.early_data == SSL_EARLY_DATA_ACCEPTED && !SSL_NO_EOED(s)) {
             st->hand_state = TLS_ST_CW_END_OF_EARLY_DATA;
             return WRITE_TRAN_CONTINUE;
         }
@@ -572,7 +574,8 @@ WRITE_TRAN ossl_statem_client_write_transition(SSL_CONNECTION *s)
         return WRITE_TRAN_CONTINUE;
 
     case TLS_ST_CW_CLNT_HELLO:
-        if (s->early_data_state == SSL_EARLY_DATA_CONNECTING) {
+        if (s->early_data_state == SSL_EARLY_DATA_CONNECTING
+                && !SSL_IS_QUIC_HANDSHAKE(s)) {
             /*
              * We are assuming this is a TLSv1.3 connection, although we haven't
              * actually selected a version yet.
@@ -906,6 +909,17 @@ WORK_STATE ossl_statem_client_post_work(SSL_CONNECTION *s, WORK_STATE wst)
             if (s->post_handshake_auth != SSL_PHA_REQUESTED) {
                 if (!ssl->method->ssl3_enc->change_cipher_state(s,
                         SSL3_CC_APPLICATION | SSL3_CHANGE_CIPHER_CLIENT_WRITE)) {
+                    /* SSLfatal() already called */
+                    return WORK_ERROR;
+                }
+                /*
+                 * For QUIC we deferred setting up these keys until now so
+                 * that we can ensure write keys are always set up before read
+                 * keys.
+                 */
+                if (SSL_IS_QUIC_HANDSHAKE(s)
+                        && !ssl->method->ssl3_enc->change_cipher_state(s,
+                            SSL3_CC_APPLICATION | SSL3_CHANGE_CIPHER_CLIENT_READ)) {
                     /* SSLfatal() already called */
                     return WORK_ERROR;
                 }
@@ -1786,8 +1800,7 @@ MSG_PROCESS_RETURN tls_process_server_hello(SSL_CONNECTION *s, PACKET *pkt)
      */
     if (SSL_CONNECTION_IS_TLS13(s)) {
         if (!ssl->method->ssl3_enc->setup_key_block(s)
-                || !ssl->method->ssl3_enc->change_cipher_state(s,
-                    SSL3_CC_HANDSHAKE | SSL3_CHANGE_CIPHER_CLIENT_READ)) {
+                || !tls13_store_handshake_traffic_hash(s)) {
             /* SSLfatal() already called */
             goto err;
         }
@@ -1800,10 +1813,17 @@ MSG_PROCESS_RETURN tls_process_server_hello(SSL_CONNECTION *s, PACKET *pkt)
          * are changed. Since QUIC doesn't do TLS early data or need middlebox
          * compat this doesn't cause a problem.
          */
-        if (s->early_data_state == SSL_EARLY_DATA_NONE
-                && (s->options & SSL_OP_ENABLE_MIDDLEBOX_COMPAT) == 0
-                && !ssl->method->ssl3_enc->change_cipher_state(s,
+        if (SSL_IS_QUIC_HANDSHAKE(s)
+                || (s->early_data_state == SSL_EARLY_DATA_NONE
+                    && (s->options & SSL_OP_ENABLE_MIDDLEBOX_COMPAT) == 0)) {
+            if (!ssl->method->ssl3_enc->change_cipher_state(s,
                     SSL3_CC_HANDSHAKE | SSL3_CHANGE_CIPHER_CLIENT_WRITE)) {
+                /* SSLfatal() already called */
+                goto err;
+                    }
+        }
+        if (!ssl->method->ssl3_enc->change_cipher_state(s,
+                    SSL3_CC_HANDSHAKE | SSL3_CHANGE_CIPHER_CLIENT_READ)) {
             /* SSLfatal() already called */
             goto err;
         }
@@ -1910,6 +1930,7 @@ static WORK_STATE tls_post_process_server_rpk(SSL_CONNECTION *sc,
 {
     size_t certidx;
     const SSL_CERT_LOOKUP *clu;
+    int v_ok;
 
     if (sc->session->peer_rpk == NULL) {
         SSLfatal(sc, SSL_AD_ILLEGAL_PARAMETER,
@@ -1919,9 +1940,19 @@ static WORK_STATE tls_post_process_server_rpk(SSL_CONNECTION *sc,
 
     if (sc->rwstate == SSL_RETRY_VERIFY)
         sc->rwstate = SSL_NOTHING;
-    if (ssl_verify_rpk(sc, sc->session->peer_rpk) > 0
-            && sc->rwstate == SSL_RETRY_VERIFY)
+
+    ERR_set_mark();
+    v_ok = ssl_verify_rpk(sc, sc->session->peer_rpk);
+    if (v_ok <= 0 && sc->verify_mode != SSL_VERIFY_NONE) {
+        ERR_clear_last_mark();
+        SSLfatal(sc, ssl_x509err2alert(sc->verify_result),
+                 SSL_R_CERTIFICATE_VERIFY_FAILED);
+        return WORK_ERROR;
+    }
+    ERR_pop_to_mark();      /* but we keep s->verify_result */
+    if (v_ok > 0 && sc->rwstate == SSL_RETRY_VERIFY) {
         return WORK_MORE_A;
+    }
 
     if ((clu = ssl_cert_lookup_by_pkey(sc->session->peer_rpk, &certidx,
                                        SSL_CONNECTION_GET_CTX(sc))) == NULL) {
@@ -2071,10 +2102,7 @@ WORK_STATE tls_post_process_server_certificate(SSL_CONNECTION *s,
 
     if (s->rwstate == SSL_RETRY_VERIFY)
         s->rwstate = SSL_NOTHING;
-    i = ssl_verify_cert_chain(s, s->session->peer_chain);
-    if (i > 0 && s->rwstate == SSL_RETRY_VERIFY) {
-        return WORK_MORE_A;
-    }
+
     /*
      * The documented interface is that SSL_VERIFY_PEER should be set in order
      * for client side verification of the server certificate to take place.
@@ -2089,12 +2117,17 @@ WORK_STATE tls_post_process_server_certificate(SSL_CONNECTION *s,
      * (less clean) historic behaviour of performing validation if any flag is
      * set. The *documented* interface remains the same.
      */
-    if (s->verify_mode != SSL_VERIFY_NONE && i <= 0) {
+    ERR_set_mark();
+    i = ssl_verify_cert_chain(s, s->session->peer_chain);
+    if (i <= 0 && s->verify_mode != SSL_VERIFY_NONE) {
+        ERR_clear_last_mark();
         SSLfatal(s, ssl_x509err2alert(s->verify_result),
                  SSL_R_CERTIFICATE_VERIFY_FAILED);
         return WORK_ERROR;
     }
-    ERR_clear_error();          /* but we keep s->verify_result */
+    ERR_pop_to_mark();      /* but we keep s->verify_result */
+    if (i > 0 && s->rwstate == SSL_RETRY_VERIFY)
+        return WORK_MORE_A;
 
     /*
      * Inconsistency alert: cert_chain does include the peer's certificate,
@@ -2127,8 +2160,12 @@ WORK_STATE tls_post_process_server_certificate(SSL_CONNECTION *s,
         }
     }
 
+    if (!X509_up_ref(x)) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+        return WORK_ERROR;
+    }
+
     X509_free(s->session->peer);
-    X509_up_ref(x);
     s->session->peer = x;
     s->session->verify_result = s->verify_result;
     /* Ensure there is no RPK */
@@ -2564,7 +2601,7 @@ MSG_PROCESS_RETURN tls_process_certificate_request(SSL_CONNECTION *s,
     if (s->s3.tmp.valid_flags != NULL)
         memset(s->s3.tmp.valid_flags, 0, s->ssl_pkey_num * sizeof(uint32_t));
     else
-        s->s3.tmp.valid_flags = OPENSSL_zalloc(s->ssl_pkey_num * sizeof(uint32_t));
+        s->s3.tmp.valid_flags = OPENSSL_calloc(s->ssl_pkey_num, sizeof(uint32_t));
 
     /* Give up for good if allocation didn't work */
     if (s->s3.tmp.valid_flags == NULL)
@@ -2864,40 +2901,77 @@ MSG_PROCESS_RETURN tls_process_new_session_ticket(SSL_CONNECTION *s,
  * In TLSv1.3 this is called from the extensions code, otherwise it is used to
  * parse a separate message. Returns 1 on success or 0 on failure
  */
-int tls_process_cert_status_body(SSL_CONNECTION *s, PACKET *pkt)
+int tls_process_cert_status_body(SSL_CONNECTION *s, size_t chainidx, PACKET *pkt)
 {
-    size_t resplen;
     unsigned int type;
+#ifndef OPENSSL_NO_OCSP
+    size_t resplen;
+    unsigned char *respder;
+    OCSP_RESPONSE *resp = NULL;
+    const unsigned char *p;
+#endif
 
     if (!PACKET_get_1(pkt, &type)
         || type != TLSEXT_STATUSTYPE_ocsp) {
         SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_R_UNSUPPORTED_STATUS_TYPE);
         return 0;
     }
-    if (!PACKET_get_net_3_len(pkt, &resplen)
-        || PACKET_remaining(pkt) != resplen) {
-        SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_R_LENGTH_MISMATCH);
-        return 0;
-    }
-    s->ext.ocsp.resp = OPENSSL_malloc(resplen);
-    if (s->ext.ocsp.resp == NULL) {
-        s->ext.ocsp.resp_len = 0;
-        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_CRYPTO_LIB);
-        return 0;
-    }
-    s->ext.ocsp.resp_len = resplen;
-    if (!PACKET_copy_bytes(pkt, s->ext.ocsp.resp, resplen)) {
-        SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_R_LENGTH_MISMATCH);
-        return 0;
+
+#ifndef OPENSSL_NO_OCSP
+    OPENSSL_free(s->ext.ocsp.resp);
+    s->ext.ocsp.resp = NULL;
+    s->ext.ocsp.resp_len = 0;
+
+    if (s->ext.ocsp.resp_ex == NULL)
+        s->ext.ocsp.resp_ex = sk_OCSP_RESPONSE_new_null();
+
+    /*
+     * TODO(DTLS-1.3): in future DTLS should also be considered
+     */
+    if (!SSL_CONNECTION_IS_TLS13(s) && type == TLSEXT_STATUSTYPE_ocsp) {
+        sk_OCSP_RESPONSE_pop_free(s->ext.ocsp.resp_ex, OCSP_RESPONSE_free);
+        s->ext.ocsp.resp_ex = sk_OCSP_RESPONSE_new_null();
     }
 
+    if (PACKET_remaining(pkt) > 0) {
+        if (!PACKET_get_net_3_len(pkt, &resplen)
+            || PACKET_remaining(pkt) != resplen) {
+            SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_R_LENGTH_MISMATCH);
+            return 0;
+        }
+
+        if (resplen > 0) {
+            respder = OPENSSL_malloc(resplen);
+
+            if (respder == NULL) {
+                SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_CRYPTO_LIB);
+                return 0;
+            }
+
+            if (!PACKET_copy_bytes(pkt, respder, resplen)) {
+                SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_R_LENGTH_MISMATCH);
+                OPENSSL_free(respder);
+                return 0;
+            }
+            p = respder;
+            resp = d2i_OCSP_RESPONSE(NULL, &p, (long)resplen);
+            OPENSSL_free(respder);
+            if (resp == NULL) {
+                SSLfatal(s, TLS1_AD_BAD_CERTIFICATE_STATUS_RESPONSE,
+                         SSL_R_TLSV1_BAD_CERTIFICATE_STATUS_RESPONSE);
+                return 0;
+            }
+            sk_OCSP_RESPONSE_insert(s->ext.ocsp.resp_ex, resp, (int)chainidx);
+        }
+    }
+
+#endif
     return 1;
 }
 
-
 MSG_PROCESS_RETURN tls_process_cert_status(SSL_CONNECTION *s, PACKET *pkt)
 {
-    if (!tls_process_cert_status_body(s, pkt)) {
+    if (!tls_process_cert_status_body(s, 0, pkt)) {
         /* SSLfatal() already called */
         return MSG_PROCESS_ERROR;
     }
@@ -3797,6 +3871,7 @@ CON_FUNC_RETURN tls_construct_client_certificate(SSL_CONNECTION *s,
      * moment. We need to do it now.
      */
     if (SSL_CONNECTION_IS_TLS13(s)
+            && !SSL_IS_QUIC_HANDSHAKE(s)
             && SSL_IS_FIRST_HANDSHAKE(s)
             && (s->early_data_state != SSL_EARLY_DATA_NONE
                 || (s->options & SSL_OP_ENABLE_MIDDLEBOX_COMPAT) != 0)
@@ -3872,8 +3947,8 @@ CON_FUNC_RETURN tls_construct_client_compressed_certificate(SSL_CONNECTION *sc,
             || !WPACKET_reserve_bytes(pkt, max_length, NULL))
         goto err;
 
-    comp_len = COMP_compress_block(comp, WPACKET_get_curr(pkt), max_length,
-                                   (unsigned char *)buf->data, length);
+    comp_len = COMP_compress_block(comp, WPACKET_get_curr(pkt), (int)max_length,
+                                   (unsigned char *)buf->data, (int)length);
     if (comp_len <= 0)
         goto err;
 
@@ -3887,6 +3962,7 @@ CON_FUNC_RETURN tls_construct_client_compressed_certificate(SSL_CONNECTION *sc,
      * moment. We need to do it now.
      */
     if (SSL_IS_FIRST_HANDSHAKE(sc)
+            && !SSL_IS_QUIC_HANDSHAKE(sc)
             && (sc->early_data_state != SSL_EARLY_DATA_NONE
                 || (sc->options & SSL_OP_ENABLE_MIDDLEBOX_COMPAT) != 0)
             && (!ssl->method->ssl3_enc->change_cipher_state(sc,

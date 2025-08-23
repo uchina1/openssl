@@ -1,5 +1,5 @@
 /*
- * Copyright 2016-2022 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2016-2025 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -19,6 +19,7 @@
 
 /* for SSL_READ_ETM() */
 #include "../ssl/ssl_local.h"
+#include "internal/ssl_unwrap.h"
 
 static int debug = 0;
 
@@ -101,7 +102,7 @@ static int mtu_test(SSL_CTX *ctx, const char *cs, int no_etm)
     for (s = mtus[0]; s <= mtus[29]; s++) {
         size_t reclen;
 
-        if (!TEST_int_eq(SSL_write(clnt_ssl, buf, s), (int)s))
+        if (!TEST_int_eq(SSL_write(clnt_ssl, buf, (int)s), (int)s))
             goto end;
         reclen = BIO_read(sc_bio, buf, sizeof(buf));
         if (debug)

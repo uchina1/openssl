@@ -7,6 +7,11 @@
  * https://www.openssl.org/source/license.html
  */
 
+/*
+ * because of EVP_PKEY_asn1_find deprecation
+ */
+#include "internal/deprecated.h"
+
 #include <stdio.h>
 #include "internal/cryptlib.h"
 #include "internal/refcount.h"
@@ -119,7 +124,7 @@ int X509_up_ref(X509 *x)
     if (CRYPTO_UP_REF(&x->references, &i) <= 0)
         return 0;
 
-    REF_PRINT_COUNT("X509", x);
+    REF_PRINT_COUNT("X509", i, x);
     REF_ASSERT_ISNT(i < 2);
     return i > 1;
 }

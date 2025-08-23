@@ -1,5 +1,5 @@
 /*
- * Copyright 2022-2024 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2022-2025 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -8,6 +8,7 @@
  */
 
 #include <stdio.h>
+#include <stdbool.h>
 #include <string.h>
 
 #include "testutil.h"
@@ -119,7 +120,6 @@ typedef void (*fp_pz_type)(OSSL_JSON_ENC *, const void *, size_t);
 #define OPJ_BOOL(x)           OP_CALL_I(ossl_json_bool, (x))
 #define OPJ_U64(x)            OP_CALL_U64(ossl_json_u64, (x))
 #define OPJ_I64(x)            OP_CALL_I64(ossl_json_i64, (x))
-#define OPJ_F64(x)            OP_CALL_D(ossl_json_f64, (x))
 #define OPJ_KEY(x)            OP_CALL_P(ossl_json_key, (x))
 #define OPJ_STR(x)            OP_CALL_P(ossl_json_str, (x))
 #define OPJ_STR_LEN(x, xl)    OP_CALL_PZ(ossl_json_str_len, (x), (xl))
@@ -173,11 +173,11 @@ BEGIN_SCRIPT(array_empty, "serialize an empty array", 0)
 END_SCRIPT_EXPECTING_Q([])
 
 BEGIN_SCRIPT(bool_false, "serialize false", 0)
-    OPJ_BOOL(0)
+    OPJ_BOOL(false)
 END_SCRIPT_EXPECTING_Q(false)
 
 BEGIN_SCRIPT(bool_true, "serialize true", 0)
-    OPJ_BOOL(1)
+    OPJ_BOOL(true)
 END_SCRIPT_EXPECTING_Q(true)
 
 BEGIN_SCRIPT(u64_0, "serialize u64(0)", 0)

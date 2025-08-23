@@ -625,9 +625,8 @@ __owur static int ecp_nistz256_windowed_mul(const EC_GROUP *group,
     if ((num * 16 + 6) > OPENSSL_MALLOC_MAX_NELEMS(P256_POINT)
         || (table_storage =
             OPENSSL_malloc((num * 16 + 5) * sizeof(P256_POINT) + 64)) == NULL
-        || (p_str =
-            OPENSSL_malloc(num * 33 * sizeof(unsigned char))) == NULL
-        || (scalars = OPENSSL_malloc(num * sizeof(BIGNUM *))) == NULL)
+        || (p_str = OPENSSL_malloc_array(num, 33)) == NULL
+        || (scalars = OPENSSL_malloc_array(num, sizeof(BIGNUM *))) == NULL)
         goto err;
 
     table = (void *)ALIGNPTR(table_storage, 64);
@@ -1109,11 +1108,11 @@ __owur static int ecp_nistz256_points_mul(const EC_GROUP *group,
          * Without a precomputed table for the generator, it has to be
          * handled like a normal point.
          */
-        new_scalars = OPENSSL_malloc((num + 1) * sizeof(BIGNUM *));
+        new_scalars = OPENSSL_malloc_array(num + 1, sizeof(BIGNUM *));
         if (new_scalars == NULL)
             goto err;
 
-        new_points = OPENSSL_malloc((num + 1) * sizeof(EC_POINT *));
+        new_points = OPENSSL_malloc_array(num + 1, sizeof(EC_POINT *));
         if (new_points == NULL)
             goto err;
 
@@ -1238,7 +1237,7 @@ void EC_nistz256_pre_comp_free(NISTZ256_PRE_COMP *pre)
         return;
 
     CRYPTO_DOWN_REF(&pre->references, &i);
-    REF_PRINT_COUNT("EC_nistz256", pre);
+    REF_PRINT_COUNT("EC_nistz256", i, pre);
     if (i > 0)
         return;
     REF_ASSERT_ISNT(i < 0);
@@ -1522,7 +1521,7 @@ static int ecp_nistz256group_full_init(EC_GROUP *group,
         goto err;
     }
     if ((order = BN_bin2bn(params + 5 * param_len, param_len, NULL)) == NULL
-        || !BN_set_word(x, (BN_ULONG)1)) { // cofactor is 1
+        || !BN_set_word(x, (BN_ULONG)1)) { /* cofactor is 1 */
         ERR_raise(ERR_LIB_EC, ERR_R_BN_LIB);
         goto err;
     }

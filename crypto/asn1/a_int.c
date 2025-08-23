@@ -40,7 +40,7 @@ int ASN1_INTEGER_cmp(const ASN1_INTEGER *x, const ASN1_INTEGER *y)
         return ret;
 }
 
-/*-
+/*
  * This converts a big endian buffer and sign into its content encoding.
  * This is used for INTEGER and ENUMERATED types.
  * The internal representation is an ASN1_STRING whose data is a big endian
@@ -206,7 +206,16 @@ static size_t c2i_ibuf(unsigned char *b, int *pneg,
 
 int ossl_i2c_ASN1_INTEGER(ASN1_INTEGER *a, unsigned char **pp)
 {
-    return i2c_ibuf(a->data, a->length, a->type & V_ASN1_NEG, pp);
+    unsigned char *ptr = pp != NULL ? *pp : NULL;
+    size_t ret = i2c_ibuf(a->data, a->length, a->type & V_ASN1_NEG, &ptr);
+
+    if (ret > INT_MAX) {
+        ERR_raise(ERR_LIB_ASN1, ASN1_R_TOO_LARGE);
+        return 0;
+    }
+    if (pp != NULL)
+        *pp = ptr;
+    return (int)ret;
 }
 
 /* Convert big endian buffer into uint64_t, return 0 on error */
@@ -260,12 +269,16 @@ static int asn1_get_int64(int64_t *pr, const unsigned char *b, size_t blen,
         return 0;
     if (neg) {
         if (r <= INT64_MAX) {
-            /* Most significant bit is guaranteed to be clear, negation
-             * is guaranteed to be meaningful in platform-neutral sense. */
+            /*
+             * Most significant bit is guaranteed to be clear, negation
+             * is guaranteed to be meaningful in platform-neutral sense.
+             */
             *pr = -(int64_t)r;
         } else if (r == ABS_INT64_MIN) {
-            /* This never happens if INT64_MAX == ABS_INT64_MIN, e.g.
-             * on ones'-complement system. */
+            /*
+             * This never happens if INT64_MAX == ABS_INT64_MIN, e.g.
+             * on ones'-complement system.
+             */
             *pr = (int64_t)(0 - r);
         } else {
             ERR_raise(ERR_LIB_ASN1, ASN1_R_TOO_SMALL);
@@ -303,7 +316,7 @@ ASN1_INTEGER *ossl_c2i_ASN1_INTEGER(ASN1_INTEGER **a, const unsigned char **pp,
     } else
         ret = *a;
 
-    if (ASN1_STRING_set(ret, NULL, r) == 0) {
+    if (r > INT_MAX || ASN1_STRING_set(ret, NULL, (int)r) == 0) {
         ERR_raise(ERR_LIB_ASN1, ERR_R_ASN1_LIB);
         goto err;
     }
@@ -345,18 +358,20 @@ static int asn1_string_set_int64(ASN1_STRING *a, int64_t r, int itype)
 
     a->type = itype;
     if (r < 0) {
-        /* Most obvious '-r' triggers undefined behaviour for most
+        /*
+         * Most obvious '-r' triggers undefined behaviour for most
          * common INT64_MIN. Even though below '0 - (uint64_t)r' can
          * appear two's-complement centric, it does produce correct/
-         * expected result even on one's-complement. This is because
-         * cast to unsigned has to change bit pattern... */
+         * expected result even on ones' complement. This is because
+         * cast to unsigned has to change bit pattern...
+         */
         off = asn1_put_uint64(tbuf, 0 - (uint64_t)r);
         a->type |= V_ASN1_NEG;
     } else {
         off = asn1_put_uint64(tbuf, r);
         a->type &= ~V_ASN1_NEG;
     }
-    return ASN1_STRING_set(a, tbuf + off, sizeof(tbuf) - off);
+    return ASN1_STRING_set(a, tbuf + off, (int)(sizeof(tbuf) - off));
 }
 
 static int asn1_string_get_uint64(uint64_t *pr, const ASN1_STRING *a,
@@ -384,7 +399,7 @@ static int asn1_string_set_uint64(ASN1_STRING *a, uint64_t r, int itype)
 
     a->type = itype;
     off = asn1_put_uint64(tbuf, r);
-    return ASN1_STRING_set(a, tbuf + off, sizeof(tbuf) - off);
+    return ASN1_STRING_set(a, tbuf + off, (int)(sizeof(tbuf) - off));
 }
 
 /*
@@ -636,6 +651,6 @@ int ossl_i2c_uint64_int(unsigned char *p, uint64_t r, int neg)
     size_t off;
 
     off = asn1_put_uint64(buf, r);
-    return i2c_ibuf(buf + off, sizeof(buf) - off, neg, &p);
+    return (int)i2c_ibuf(buf + off, sizeof(buf) - off, neg, &p);
 }
 

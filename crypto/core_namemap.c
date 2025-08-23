@@ -1,5 +1,5 @@
 /*
- * Copyright 2019-2024 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2019-2025 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -7,13 +7,19 @@
  * https://www.openssl.org/source/license.html
  */
 
+/*
+ * For EVP_PKEY_asn1_get0_info(), EVP_PKEY_asn1_get_count() and
+ * EVP_PKEY_asn1_get0()
+ */
+#define OPENSSL_SUPPRESS_DEPRECATED
+
 #include "internal/namemap.h"
 #include "internal/tsan_assist.h"
 #include "internal/hashtable.h"
 #include "internal/sizes.h"
 #include "crypto/context.h"
 
-#define NAMEMAP_HT_BUCKETS 2048
+#define NAMEMAP_HT_BUCKETS 512
 
 HT_START_KEY_DEFN(namenum_key)
 HT_DEF_KEY_FIELD_CHAR_ARRAY(name, 64)
@@ -24,10 +30,8 @@ HT_END_KEY_DEFN(NAMENUM_KEY)
  * ==================
  */
 
-typedef char STRING;
-typedef STACK_OF(STRING) NAMES;
+typedef STACK_OF(OPENSSL_STRING) NAMES;
 
-DEFINE_STACK_OF(STRING)
 DEFINE_STACK_OF(NAMES)
 
 struct ossl_namemap_st {
@@ -49,7 +53,7 @@ static void name_string_free(char *name)
 
 static void names_free(NAMES *n)
 {
-    sk_STRING_pop_free(n, name_string_free);
+    sk_OPENSSL_STRING_pop_free(n, name_string_free);
 }
 
 /* OSSL_LIB_CTX_METHOD functions for a namemap stored in a library context */
@@ -125,17 +129,17 @@ int ossl_namemap_doall_names(const OSSL_NAMEMAP *namemap, int number,
 
     names = sk_NAMES_value(namemap->numnames, number - 1);
     if (names != NULL)
-        names = sk_STRING_dup(names);
+        names = sk_OPENSSL_STRING_dup(names);
 
     CRYPTO_THREAD_unlock(namemap->lock);
 
     if (names == NULL)
         return 0;
 
-    for (i = 0; i < sk_STRING_num(names); i++)
-        fn(sk_STRING_value(names, i), data);
+    for (i = 0; i < sk_OPENSSL_STRING_num(names); i++)
+        fn(sk_OPENSSL_STRING_value(names, i), data);
 
-    sk_STRING_free(names);
+    sk_OPENSSL_STRING_free(names);
     return i > 0;
 }
 
@@ -165,23 +169,35 @@ int ossl_namemap_name2num(const OSSL_NAMEMAP *namemap, const char *name)
     return number;
 }
 
-/* TODO: Optimize to avoid strndup() */
 int ossl_namemap_name2num_n(const OSSL_NAMEMAP *namemap,
                             const char *name, size_t name_len)
 {
-    char *tmp;
-    int ret;
+    int number = 0;
+    HT_VALUE *val;
+    NAMENUM_KEY key;
 
-    if (name == NULL || (tmp = OPENSSL_strndup(name, name_len)) == NULL)
+#ifndef FIPS_MODULE
+    if (namemap == NULL)
+        namemap = ossl_namemap_stored(NULL);
+#endif
+
+    if (namemap == NULL)
         return 0;
 
-    ret = ossl_namemap_name2num(namemap, tmp);
-    OPENSSL_free(tmp);
-    return ret;
+    HT_INIT_KEY(&key);
+    HT_SET_KEY_STRING_CASE_N(&key, name, name, (int)name_len);
+
+    val = ossl_ht_get(namemap->namenum_ht, TO_HT_KEY(&key));
+
+    if (val != NULL)
+        /* We store a (small) int directly instead of a pointer to it. */
+        number = (int)(intptr_t)val->value;
+
+    return number;
 }
 
 const char *ossl_namemap_num2name(const OSSL_NAMEMAP *namemap, int number,
-                                  size_t idx)
+                                  int idx)
 {
     NAMES *names;
     const char *ret = NULL;
@@ -194,7 +210,7 @@ const char *ossl_namemap_num2name(const OSSL_NAMEMAP *namemap, int number,
 
     names = sk_NAMES_value(namemap->numnames, number - 1);
     if (names != NULL)
-        ret = sk_STRING_value(names, idx);
+        ret = sk_OPENSSL_STRING_value(names, idx);
 
     CRYPTO_THREAD_unlock(namemap->lock);
 
@@ -216,7 +232,7 @@ static int numname_insert(OSSL_NAMEMAP *namemap, int number,
         }
     } else {
         /* a completely new entry */
-        names = sk_STRING_new_null();
+        names = sk_OPENSSL_STRING_new_null();
         if (names == NULL)
             return 0;
     }
@@ -224,8 +240,9 @@ static int numname_insert(OSSL_NAMEMAP *namemap, int number,
     if ((tmpname = OPENSSL_strdup(name)) == NULL)
         goto err;
 
-    if (!sk_STRING_push(names, tmpname))
+    if (!sk_OPENSSL_STRING_push(names, tmpname))
         goto err;
+    tmpname = NULL;
 
     if (number <= 0) {
         if (!sk_NAMES_push(namemap->numnames, names))
@@ -236,7 +253,7 @@ static int numname_insert(OSSL_NAMEMAP *namemap, int number,
 
  err:
     if (number <= 0)
-        sk_STRING_free(names);
+        sk_OPENSSL_STRING_pop_free(names, name_string_free);
     OPENSSL_free(tmpname);
     return 0;
 }
@@ -263,11 +280,12 @@ static int namemap_add_name(OSSL_NAMEMAP *namemap, int number,
     HT_SET_KEY_STRING_CASE(&key, name, name);
     val.value = (void *)(intptr_t)number;
     ret = ossl_ht_insert(namemap->namenum_ht, TO_HT_KEY(&key), &val, NULL);
-    if (!ossl_assert(ret != 0)) /* cannot happen as we are under write lock */
-        return 0;
-    if (ret < 1) {
-        /* unable to insert due to too many collisions */
-        ERR_raise(ERR_LIB_CRYPTO, CRYPTO_R_TOO_MANY_NAMES);
+    if (ret <= 0) {
+        /*
+         * We either got an allocation failure (INTERNAL_ERROR), or
+         * hit too many conflicts in the table (TOO_MANY_NAMES)
+         */
+        ERR_raise(ERR_LIB_CRYPTO, (ret < 0) ? CRYPTO_R_TOO_MANY_NAMES : ERR_R_INTERNAL_ERROR);
         return 0;
     }
     return number;
@@ -421,6 +439,7 @@ static void get_legacy_md_names(const OBJ_NAME *on, void *arg)
         get_legacy_evp_names(0, EVP_MD_get_type(md), NULL, arg);
 }
 
+# ifndef OPENSSL_NO_DEPRECATED_3_6
 static void get_legacy_pkey_meth_names(const EVP_PKEY_ASN1_METHOD *ameth,
                                        void *arg)
 {
@@ -459,6 +478,7 @@ static void get_legacy_pkey_meth_names(const EVP_PKEY_ASN1_METHOD *ameth,
         }
     }
 }
+# endif /* OPENSSL_NO_DEPRECATED_3_6 */
 #endif
 
 /*-
@@ -487,7 +507,7 @@ OSSL_NAMEMAP *ossl_namemap_stored(OSSL_LIB_CTX *libctx)
         return NULL;
     }
     if (nms == 1) {
-        int i, end;
+        int num;
 
         /* Before pilfering, we make sure the legacy database is populated */
         OPENSSL_init_crypto(OPENSSL_INIT_ADD_ALL_CIPHERS
@@ -498,9 +518,26 @@ OSSL_NAMEMAP *ossl_namemap_stored(OSSL_LIB_CTX *libctx)
         OBJ_NAME_do_all(OBJ_NAME_TYPE_MD_METH,
                         get_legacy_md_names, namemap);
 
-        /* We also pilfer data from the legacy EVP_PKEY_ASN1_METHODs */
-        for (i = 0, end = EVP_PKEY_asn1_get_count(); i < end; i++)
-            get_legacy_pkey_meth_names(EVP_PKEY_asn1_get0(i), namemap);
+        /*
+         * Some old providers (<= 3.5) may not have the rsassaPSS alias which
+         * may cause problems in some cases. We add it manually here
+         */
+        num = ossl_namemap_add_name(namemap, 0, "RSA-PSS");
+        if (num != 0) {
+            ossl_namemap_add_name(namemap, num, "rsassaPss");
+            /* Add other RSA-PSS aliases as well */
+            ossl_namemap_add_name(namemap, num, "RSASSA-PSS");
+            ossl_namemap_add_name(namemap, num, "1.2.840.113549.1.1.10");
+        }
+# ifndef OPENSSL_NO_DEPRECATED_3_6
+        {
+            int i, end;
+
+            /* We also pilfer data from the legacy EVP_PKEY_ASN1_METHODs */
+            for (i = 0, end = EVP_PKEY_asn1_get_count(); i < end; i++)
+                get_legacy_pkey_meth_names(EVP_PKEY_asn1_get0(i), namemap);
+        }
+# endif
     }
 #endif
 

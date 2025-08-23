@@ -1,5 +1,5 @@
 /*
- * Copyright 1995-2024 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 1995-2025 The OpenSSL Project Authors. All Rights Reserved.
  * Copyright (c) 2002, Oracle and/or its affiliates. All rights reserved
  * Copyright 2005 Nokia. All rights reserved.
  *
@@ -21,6 +21,8 @@
 #include <openssl/x509v3.h>
 #include <openssl/core_names.h>
 #include "internal/cryptlib.h"
+#include "internal/ssl_unwrap.h"
+#include <openssl/ocsp.h>
 
 #define TLS13_NUM_CIPHERS       OSSL_NELEM(tls13_ciphers)
 #define SSL3_NUM_CIPHERS        OSSL_NELEM(ssl3_ciphers)
@@ -3403,6 +3405,7 @@ int ssl3_new(SSL *s)
 void ssl3_free(SSL *s)
 {
     SSL_CONNECTION *sc = SSL_CONNECTION_FROM_SSL(s);
+    size_t i;
 
     if (sc == NULL)
         return;
@@ -3411,8 +3414,21 @@ void ssl3_free(SSL *s)
 
     EVP_PKEY_free(sc->s3.peer_tmp);
     sc->s3.peer_tmp = NULL;
-    EVP_PKEY_free(sc->s3.tmp.pkey);
-    sc->s3.tmp.pkey = NULL;
+
+    for (i = 0; i < sc->s3.tmp.num_ks_pkey; i++)
+        if (sc->s3.tmp.ks_pkey[i] != NULL) {
+            if (sc->s3.tmp.pkey == sc->s3.tmp.ks_pkey[i])
+                sc->s3.tmp.pkey = NULL;
+
+            EVP_PKEY_free(sc->s3.tmp.ks_pkey[i]);
+            sc->s3.tmp.ks_pkey[i] = NULL;
+        }
+    sc->s3.tmp.num_ks_pkey = 0;
+
+    if (sc->s3.tmp.pkey != NULL) {
+        EVP_PKEY_free(sc->s3.tmp.pkey);
+        sc->s3.tmp.pkey = NULL;
+    }
 
     ssl_evp_cipher_free(sc->s3.tmp.new_sym_enc);
     ssl_evp_md_free(sc->s3.tmp.new_hash);
@@ -3427,6 +3443,7 @@ void ssl3_free(SSL *s)
     ssl3_free_digest_list(sc);
     OPENSSL_free(sc->s3.alpn_selected);
     OPENSSL_free(sc->s3.alpn_proposed);
+    ossl_quic_tls_free(sc->qtls);
 
 #ifndef OPENSSL_NO_PSK
     OPENSSL_free(sc->s3.tmp.psk);
@@ -3442,6 +3459,7 @@ int ssl3_clear(SSL *s)
 {
     SSL_CONNECTION *sc = SSL_CONNECTION_FROM_SSL(s);
     int flags;
+    size_t i;
 
     if (sc == NULL)
         return 0;
@@ -3455,8 +3473,22 @@ int ssl3_clear(SSL *s)
     OPENSSL_free(sc->s3.tmp.peer_cert_sigalgs);
     OPENSSL_free(sc->s3.tmp.valid_flags);
 
-    EVP_PKEY_free(sc->s3.tmp.pkey);
     EVP_PKEY_free(sc->s3.peer_tmp);
+
+    for (i = 0; i < sc->s3.tmp.num_ks_pkey; i++)
+        if (sc->s3.tmp.ks_pkey[i] != NULL) {
+            if (sc->s3.tmp.pkey == sc->s3.tmp.ks_pkey[i])
+                sc->s3.tmp.pkey = NULL;
+
+            EVP_PKEY_free(sc->s3.tmp.ks_pkey[i]);
+            sc->s3.tmp.ks_pkey[i] = NULL;
+        }
+    sc->s3.tmp.num_ks_pkey = 0;
+
+    if (sc->s3.tmp.pkey != NULL) {
+        EVP_PKEY_free(sc->s3.tmp.pkey);
+        sc->s3.tmp.pkey = NULL;
+    }
 
     ssl3_free_digest_list(sc);
 
@@ -3467,7 +3499,7 @@ int ssl3_clear(SSL *s)
      * NULL/zero-out everything in the s3 struct, but remember if we are doing
      * QUIC.
      */
-    flags = sc->s3.flags & TLS1_FLAGS_QUIC;
+    flags = sc->s3.flags & (TLS1_FLAGS_QUIC | TLS1_FLAGS_QUIC_INTERNAL);
     memset(&sc->s3, 0, sizeof(sc->s3));
     sc->s3.flags |= flags;
 
@@ -3503,6 +3535,10 @@ long ssl3_ctrl(SSL *s, int cmd, long larg, void *parg)
 {
     int ret = 0;
     SSL_CONNECTION *sc = SSL_CONNECTION_FROM_SSL(s);
+#ifndef OPENSSL_NO_OCSP
+    unsigned char *p = NULL;
+    OCSP_RESPONSE *resp = NULL;
+#endif
 
     if (sc == NULL)
         return ret;
@@ -3561,6 +3597,10 @@ long ssl3_ctrl(SSL *s, int cmd, long larg, void *parg)
             }
             return ssl_set_tmp_ecdh_groups(&sc->ext.supportedgroups,
                                            &sc->ext.supportedgroups_len,
+                                           &sc->ext.keyshares,
+                                           &sc->ext.keyshares_len,
+                                           &sc->ext.tuples,
+                                           &sc->ext.tuples_len,
                                            parg);
         }
 #endif                          /* !OPENSSL_NO_DEPRECATED_3_0 */
@@ -3631,16 +3671,79 @@ long ssl3_ctrl(SSL *s, int cmd, long larg, void *parg)
         break;
 
     case SSL_CTRL_GET_TLSEXT_STATUS_REQ_OCSP_RESP:
-        *(unsigned char **)parg = sc->ext.ocsp.resp;
-        if (sc->ext.ocsp.resp_len == 0
-                || sc->ext.ocsp.resp_len > LONG_MAX)
-            return -1;
-        return (long)sc->ext.ocsp.resp_len;
+        *(unsigned char **)parg = NULL;
+        ret = -1;
+
+#ifndef OPENSSL_NO_OCSP
+        resp = sk_OCSP_RESPONSE_value(sc->ext.ocsp.resp_ex, 0);
+
+        if (resp != NULL) {
+            int resp_len = i2d_OCSP_RESPONSE(resp, &p);
+
+            if (resp_len > 0) {
+                OPENSSL_free(sc->ext.ocsp.resp);
+                *(unsigned char **)parg = sc->ext.ocsp.resp = p;
+                sc->ext.ocsp.resp_len = (size_t)resp_len;
+                ret = resp_len;
+            }
+        }
+#endif
+        break;
 
     case SSL_CTRL_SET_TLSEXT_STATUS_REQ_OCSP_RESP:
-        OPENSSL_free(sc->ext.ocsp.resp);
-        sc->ext.ocsp.resp = parg;
-        sc->ext.ocsp.resp_len = larg;
+        ret = 1;
+#ifndef OPENSSL_NO_OCSP
+        /*
+         * cleanup single values, which might be set somewhere else
+         * we only use the extended values
+         */
+        if (sc->ext.ocsp.resp != NULL) {
+            OPENSSL_free(sc->ext.ocsp.resp);
+            sc->ext.ocsp.resp = NULL;
+            sc->ext.ocsp.resp_len = 0;
+        }
+
+        sk_OCSP_RESPONSE_pop_free(sc->ext.ocsp.resp_ex, OCSP_RESPONSE_free);
+        sc->ext.ocsp.resp_ex = NULL;
+
+        if (parg != NULL) {
+            sc->ext.ocsp.resp_ex = sk_OCSP_RESPONSE_new_reserve(NULL, 1);
+            if (sc->ext.ocsp.resp_ex == NULL)
+                return 0;
+
+            p = parg;
+            resp = d2i_OCSP_RESPONSE(NULL, (const unsigned char **)&p, larg);
+            if (resp != NULL)
+                sk_OCSP_RESPONSE_push(sc->ext.ocsp.resp_ex, resp);
+        }
+#endif
+        break;
+
+    case SSL_CTRL_GET_TLSEXT_STATUS_REQ_OCSP_RESP_EX:
+#ifndef OPENSSL_NO_OCSP
+        *(STACK_OF(OCSP_RESPONSE) **)parg = sc->ext.ocsp.resp_ex;
+        ret = sk_OCSP_RESPONSE_num(sc->ext.ocsp.resp_ex);
+#else
+        *(unsigned char **)parg = NULL;
+        ret = -1;
+#endif
+        break;
+
+    case SSL_CTRL_SET_TLSEXT_STATUS_REQ_OCSP_RESP_EX:
+#ifndef OPENSSL_NO_OCSP
+        /*
+         * cleanup single values, which might be set somewhere else
+         * we only use the extended values
+         */
+        if (sc->ext.ocsp.resp != NULL) {
+            OPENSSL_free(sc->ext.ocsp.resp);
+            sc->ext.ocsp.resp = NULL;
+            sc->ext.ocsp.resp_len = 0;
+        }
+
+        sk_OCSP_RESPONSE_pop_free(sc->ext.ocsp.resp_ex, OCSP_RESPONSE_free);
+        sc->ext.ocsp.resp_ex = (STACK_OF(OCSP_RESPONSE) *)parg;
+#endif
         ret = 1;
         break;
 
@@ -3713,11 +3816,22 @@ long ssl3_ctrl(SSL *s, int cmd, long larg, void *parg)
 
     case SSL_CTRL_SET_GROUPS:
         return tls1_set_groups(&sc->ext.supportedgroups,
-                               &sc->ext.supportedgroups_len, parg, larg);
+                               &sc->ext.supportedgroups_len,
+                               &sc->ext.keyshares,
+                               &sc->ext.keyshares_len,
+                               &sc->ext.tuples,
+                               &sc->ext.tuples_len,
+                               parg, larg);
 
     case SSL_CTRL_SET_GROUPS_LIST:
-        return tls1_set_groups_list(s->ctx, &sc->ext.supportedgroups,
-                                    &sc->ext.supportedgroups_len, parg);
+        return tls1_set_groups_list(s->ctx,
+                                    &sc->ext.supportedgroups,
+                                    &sc->ext.supportedgroups_len,
+                                    &sc->ext.keyshares,
+                                    &sc->ext.keyshares_len,
+                                    &sc->ext.tuples,
+                                    &sc->ext.tuples_len,
+                                    parg);
 
     case SSL_CTRL_GET_SHARED_GROUP:
         {
@@ -3734,7 +3848,7 @@ long ssl3_ctrl(SSL *s, int cmd, long larg, void *parg)
             if (SSL_CONNECTION_IS_TLS13(sc) && sc->s3.did_kex)
                 id = sc->s3.group_id;
             else
-                id = sc->session->kex_group;
+                id = (sc->session != NULL) ? sc->session->kex_group : NID_undef;
             ret = tls1_group_id2nid(id, 1);
             break;
         }
@@ -3757,7 +3871,7 @@ long ssl3_ctrl(SSL *s, int cmd, long larg, void *parg)
                 return 0;
             if (pctype)
                 *pctype = sc->s3.tmp.ctype;
-            return sc->s3.tmp.ctype_len;
+            return (long)sc->s3.tmp.ctype_len;
         }
 
     case SSL_CTRL_SET_CLIENT_CERT_TYPES:
@@ -3780,10 +3894,22 @@ long ssl3_ctrl(SSL *s, int cmd, long larg, void *parg)
     case SSL_CTRL_GET_CHAIN_CERT_STORE:
         return ssl_cert_get_cert_store(sc->cert, parg, 1);
 
+    case SSL_CTRL_GET_PEER_SIGNATURE_NAME:
+        if (parg == NULL || sc->s3.tmp.peer_sigalg == NULL)
+            return 0;
+        *(const char **)parg = sc->s3.tmp.peer_sigalg->name;
+        return 1;
+
     case SSL_CTRL_GET_PEER_SIGNATURE_NID:
         if (sc->s3.tmp.peer_sigalg == NULL)
             return 0;
         *(int *)parg = sc->s3.tmp.peer_sigalg->hash;
+        return 1;
+
+    case SSL_CTRL_GET_SIGNATURE_NAME:
+        if (parg == NULL || sc->s3.tmp.sigalg == NULL)
+            return 0;
+        *(const char **)parg = sc->s3.tmp.sigalg->name;
         return 1;
 
     case SSL_CTRL_GET_SIGNATURE_NID:
@@ -3796,7 +3922,9 @@ long ssl3_ctrl(SSL *s, int cmd, long larg, void *parg)
         if (sc->session == NULL || sc->s3.peer_tmp == NULL) {
             return 0;
         } else {
-            EVP_PKEY_up_ref(sc->s3.peer_tmp);
+            if (!EVP_PKEY_up_ref(sc->s3.peer_tmp))
+                return 0;
+
             *(EVP_PKEY **)parg = sc->s3.peer_tmp;
             return 1;
         }
@@ -3805,7 +3933,9 @@ long ssl3_ctrl(SSL *s, int cmd, long larg, void *parg)
         if (sc->session == NULL || sc->s3.tmp.pkey == NULL) {
             return 0;
         } else {
-            EVP_PKEY_up_ref(sc->s3.tmp.pkey);
+            if (!EVP_PKEY_up_ref(sc->s3.tmp.pkey))
+                return 0;
+
             *(EVP_PKEY **)parg = sc->s3.tmp.pkey;
             return 1;
         }
@@ -3913,6 +4043,10 @@ long ssl3_ctx_ctrl(SSL_CTX *ctx, int cmd, long larg, void *parg)
             }
             return ssl_set_tmp_ecdh_groups(&ctx->ext.supportedgroups,
                                            &ctx->ext.supportedgroups_len,
+                                           &ctx->ext.keyshares,
+                                           &ctx->ext.keyshares_len,
+                                           &ctx->ext.tuples,
+                                           &ctx->ext.tuples_len,
                                            parg);
         }
 #endif                          /* !OPENSSL_NO_DEPRECATED_3_0 */
@@ -4014,12 +4148,27 @@ long ssl3_ctx_ctrl(SSL_CTX *ctx, int cmd, long larg, void *parg)
     case SSL_CTRL_SET_GROUPS:
         return tls1_set_groups(&ctx->ext.supportedgroups,
                                &ctx->ext.supportedgroups_len,
+                               &ctx->ext.keyshares,
+                               &ctx->ext.keyshares_len,
+                               &ctx->ext.tuples,
+                               &ctx->ext.tuples_len,
                                parg, larg);
 
     case SSL_CTRL_SET_GROUPS_LIST:
-        return tls1_set_groups_list(ctx, &ctx->ext.supportedgroups,
+        return tls1_set_groups_list(ctx,
+                                    &ctx->ext.supportedgroups,
                                     &ctx->ext.supportedgroups_len,
+                                    &ctx->ext.keyshares,
+                                    &ctx->ext.keyshares_len,
+                                    &ctx->ext.tuples,
+                                    &ctx->ext.tuples_len,
                                     parg);
+
+    case SSL_CTRL_GET0_IMPLEMENTED_GROUPS:
+        return tls1_get0_implemented_groups(ctx->min_proto_version,
+                                            ctx->max_proto_version,
+                                            ctx->group_list,
+                                            ctx->group_list_len, larg, parg);
 
     case SSL_CTRL_SET_SIGALGS:
         return tls1_set_sigalgs(ctx->cert, parg, larg, 0);
@@ -4272,7 +4421,7 @@ const SSL_CIPHER *ssl3_choose_cipher(SSL_CONNECTION *s, STACK_OF(SSL_CIPHER) *cl
     if (tls1_suiteb(s)) {
         prio = srvr;
         allow = clnt;
-    } else if (s->options & SSL_OP_CIPHER_SERVER_PREFERENCE) {
+    } else if (s->options & SSL_OP_SERVER_PREFERENCE) {
         prio = srvr;
         allow = clnt;
 
@@ -4331,7 +4480,7 @@ const SSL_CIPHER *ssl3_choose_cipher(SSL_CONNECTION *s, STACK_OF(SSL_CIPHER) *cl
          * that.
          */
         if (s->psk_server_callback != NULL) {
-            for (j = 0; j < s->ssl_pkey_num && !ssl_has_cert(s, j); j++);
+            for (j = 0; j < s->ssl_pkey_num && !ssl_has_cert(s, (int)j); j++);
             if (j == s->ssl_pkey_num) {
                 /* There are no certificates */
                 prefer_sha256 = 1;
@@ -4955,7 +5104,10 @@ int ssl_derive(SSL_CONNECTION *s, EVP_PKEY *privkey, EVP_PKEY *pubkey, int gense
     }
 
     if (EVP_PKEY_derive(pctx, pms, &pmslen) <= 0) {
-        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+        /*
+         * the public key was probably a weak key
+         */
+        SSLfatal(s, SSL_AD_ILLEGAL_PARAMETER, SSL_R_BAD_KEY_SHARE);
         goto err;
     }
 
@@ -5060,7 +5212,7 @@ int ssl_encapsulate(SSL_CONNECTION *s, EVP_PKEY *pubkey,
     }
 
     if (EVP_PKEY_encapsulate(pctx, ct, &ctlen, pms, &pmslen) <= 0) {
-        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+        SSLfatal(s, SSL_AD_ILLEGAL_PARAMETER, SSL_R_BAD_KEY_SHARE);
         goto err;
     }
 

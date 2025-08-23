@@ -1,5 +1,5 @@
 /*
- * Copyright 2016-2024 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2016-2025 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -49,6 +49,7 @@
 
 static int do_fips = 0;
 static char *privkey;
+static char *storedir;
 static char *config_file = NULL;
 static int multidefault_run = 0;
 
@@ -295,7 +296,6 @@ static int torture_rw_high(void)
 }
 
 
-# ifndef OPENSSL_SYS_MACOSX 
 static CRYPTO_RCU_LOCK *rcu_lock = NULL;
 
 static int writer1_done = 0;
@@ -375,7 +375,13 @@ static void reader_fn(int *iterations)
         CRYPTO_atomic_add(&writer1_done, 0, &lw1, atomiclock);
         CRYPTO_atomic_add(&writer2_done, 0, &lw2, atomiclock);
         count++;
-        ossl_rcu_read_lock(rcu_lock);
+        if (!ossl_rcu_read_lock(rcu_lock)) {
+            TEST_info("rcu torture read lock failed");
+            rcu_torture_result = 0;
+            *iterations = count;
+            return;
+        }
+
         valp = ossl_rcu_deref(&writer_ptr);
         val = (valp == NULL) ? 0 : *valp;
 
@@ -435,7 +441,7 @@ static int _torture_rcu(void)
     writer2_done = 0;
     rcu_torture_result = 1;
 
-    rcu_lock = ossl_rcu_lock_new(1, NULL);
+    rcu_lock = ossl_rcu_lock_new(contention == 2 ? 4 : 1, NULL);
     if (rcu_lock == NULL)
         goto out;
 
@@ -492,7 +498,12 @@ static int torture_rcu_high(void)
     contention = 1;
     return _torture_rcu();
 }
-# endif
+
+static int torture_rcu_high2(void)
+{
+    contention = 2;
+    return _torture_rcu();
+}
 #endif
 
 static CRYPTO_ONCE once_run = CRYPTO_ONCE_STATIC_INIT;
@@ -583,6 +594,29 @@ static int test_thread_local(void)
 
     if (!TEST_true(CRYPTO_THREAD_cleanup_local(&thread_local_key)))
         return 0;
+    return 1;
+}
+
+/*
+ * Basic test to ensure that we can repeatedly create and
+ * destroy local keys without leaking anything
+ */
+static int test_thread_local_multi_key(void)
+{
+    int dummy;
+    int i;
+
+    for (i = 0; i < 1000; i++) {
+        if (!TEST_true(CRYPTO_THREAD_init_local(&thread_local_key,
+                                                thread_local_destructor)))
+            return 0;
+
+        if (!TEST_true(CRYPTO_THREAD_set_local(&thread_local_key, &dummy)))
+            return 0;
+
+        if (!TEST_true(CRYPTO_THREAD_cleanup_local(&thread_local_key)))
+            return 0;
+    }
     return 1;
 }
 
@@ -853,7 +887,7 @@ static void thread_general_worker(void)
         if (!TEST_true(EVP_EncryptInit_ex(cipherctx, ciph, NULL, key, iv))
                 || !TEST_true(EVP_EncryptUpdate(cipherctx, out, &ciphoutl,
                                                 (unsigned char *)message,
-                                                messlen))
+                                                (int)messlen))
                 || !TEST_true(EVP_EncryptFinal(cipherctx, out, &ciphoutl)))
             goto err;
     }
@@ -1014,6 +1048,45 @@ static int test_multi_shared_pkey(void)
     return test_multi_shared_pkey_common(&thread_shared_evp_pkey);
 }
 
+static void thread_release_shared_pkey(void)
+{
+    OSSL_sleep(0);
+    EVP_PKEY_free(shared_evp_pkey);
+}
+
+static int test_multi_shared_pkey_release(void)
+{
+    int testresult = 0;
+    size_t i = 1;
+
+    multi_intialise();
+    shared_evp_pkey = NULL;
+    if (!thread_setup_libctx(1, do_fips ? fips_and_default_providers
+                                        : default_provider)
+            || !TEST_ptr(shared_evp_pkey = load_pkey_pem(privkey, multi_libctx)))
+        goto err;
+    for (; i < 10; ++i) {
+        if (!TEST_true(EVP_PKEY_up_ref(shared_evp_pkey)))
+            goto err;
+    }
+
+    if (!start_threads(10, &thread_release_shared_pkey))
+        goto err;
+    i = 0;
+
+    if (!teardown_threads()
+            || !TEST_true(multi_success))
+        goto err;
+    testresult = 1;
+ err:
+    while (i > 0) {
+        EVP_PKEY_free(shared_evp_pkey);
+        --i;
+    }
+    thead_teardown_libctx();
+    return testresult;
+}
+
 static int test_multi_load_unload_provider(void)
 {
     EVP_MD *sha256 = NULL;
@@ -1069,7 +1142,7 @@ static int test_multi_default(void)
     multidefault_run = 1;
 
     return thread_run_test(&thread_multi_simple_fetch,
-                           2, &thread_multi_simple_fetch, 0, default_provider);
+                           2, &thread_multi_simple_fetch, 0, NULL);
 }
 
 static int test_multi_load(void)
@@ -1206,7 +1279,7 @@ static void test_pem_read_one(void)
         goto err;
     }
 
-    pem = BIO_new_mem_buf(pemdata, len);
+    pem = BIO_new_mem_buf(pemdata, (int)len);
     if (pem == NULL) {
         multi_set_success(0);
         goto err;
@@ -1227,6 +1300,62 @@ static int test_pem_read(void)
 {
     return thread_run_test(&test_pem_read_one, MAXIMUM_THREADS,
                            &test_pem_read_one, 1, default_provider);
+}
+
+static X509_STORE *store = NULL;
+
+static void test_x509_store_by_subject(void)
+{
+    X509_STORE_CTX *ctx;
+    X509_OBJECT *obj = NULL;
+    X509_NAME *name = NULL;
+    int success = 0;
+
+    ctx = X509_STORE_CTX_new();
+    if (!TEST_ptr(ctx))
+        goto err;
+
+    if (!TEST_true(X509_STORE_CTX_init(ctx, store, NULL, NULL)))
+        goto err;
+
+    name = X509_NAME_new();
+    if (!TEST_ptr(name))
+        goto err;
+    if (!TEST_true(X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+                                              (unsigned char *)"Root CA",
+                                              -1, -1, 0)))
+        goto err;
+    obj = X509_STORE_CTX_get_obj_by_subject(ctx, X509_LU_X509, name);
+    if (!TEST_ptr(obj))
+        goto err;
+
+    success = 1;
+ err:
+    X509_OBJECT_free(obj);
+    X509_STORE_CTX_free(ctx);
+    X509_NAME_free(name);
+    if (!success)
+        multi_set_success(0);
+}
+
+/* Test accessing an X509_STORE from multiple threads */
+static int test_x509_store(void)
+{
+    int ret = 0;
+
+    store = X509_STORE_new();
+    if (!TEST_ptr(store))
+        return 0;
+    if (!TEST_true(X509_STORE_load_store(store, storedir)))
+        goto err;
+
+    ret = thread_run_test(&test_x509_store_by_subject, MAXIMUM_THREADS,
+                          &test_x509_store_by_subject, 0, NULL);
+
+ err:
+    X509_STORE_free(store);
+    store = NULL;
+    return ret;
 }
 
 typedef enum OPTION_choice {
@@ -1275,6 +1404,10 @@ int setup_tests(void)
     if (!TEST_ptr(privkey))
         return 0;
 
+    storedir = test_mk_file_path(datadir, "store");
+    if (!TEST_ptr(storedir))
+        return 0;
+
     if (!TEST_ptr(global_lock = CRYPTO_THREAD_lock_new()))
         return 0;
 
@@ -1290,13 +1423,13 @@ int setup_tests(void)
 #if defined(OPENSSL_THREADS)
     ADD_TEST(torture_rw_low);
     ADD_TEST(torture_rw_high);
-# ifndef OPENSSL_SYS_MACOSX
     ADD_TEST(torture_rcu_low);
     ADD_TEST(torture_rcu_high);
-# endif
+    ADD_TEST(torture_rcu_high2);
 #endif
     ADD_TEST(test_once);
     ADD_TEST(test_thread_local);
+    ADD_TEST(test_thread_local_multi_key);
     ADD_TEST(test_atomic);
     ADD_TEST(test_multi_load);
     ADD_TEST(test_multi_general_worker_default_provider);
@@ -1306,18 +1439,21 @@ int setup_tests(void)
 #ifndef OPENSSL_NO_DEPRECATED_3_0
     ADD_TEST(test_multi_downgrade_shared_pkey);
 #endif
+    ADD_TEST(test_multi_shared_pkey_release);
     ADD_TEST(test_multi_load_unload_provider);
     ADD_TEST(test_obj_add);
 #if !defined(OPENSSL_NO_DGRAM) && !defined(OPENSSL_NO_SOCK)
     ADD_TEST(test_bio_dgram_pair);
 #endif
     ADD_TEST(test_pem_read);
+    ADD_TEST(test_x509_store);
     return 1;
 }
 
 void cleanup_tests(void)
 {
     OPENSSL_free(privkey);
+    OPENSSL_free(storedir);
 #ifdef TSAN_REQUIRES_LOCKING
     CRYPTO_THREAD_lock_free(tsan_lock);
 #endif

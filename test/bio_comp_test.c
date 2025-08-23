@@ -51,8 +51,8 @@ static int do_bio_comp_test(const BIO_METHOD *meth, size_t size)
     if (!TEST_ptr(bmem = BIO_new(BIO_s_mem())))
         goto err;
     BIO_push(bcomp, bmem);
-    osize = BIO_write(bcomp, original, size);
-    if (!TEST_int_eq(osize, size)
+    osize = BIO_write(bcomp, original, (int)size);
+    if (!TEST_int_eq(osize, (int)size)
         || !TEST_true(BIO_flush(bcomp)))
         goto err;
     BIO_free(bcomp);
@@ -62,9 +62,9 @@ static int do_bio_comp_test(const BIO_METHOD *meth, size_t size)
     if (!TEST_ptr(bexp = BIO_new(meth)))
         goto err;
     BIO_push(bexp, bmem);
-    rsize = BIO_read(bexp, result, size);
+    rsize = BIO_read(bexp, result, (int)size);
 
-    if (!TEST_int_eq(size, rsize)
+    if (!TEST_int_eq((int)size, rsize)
         || !TEST_mem_eq(original, osize, result, rsize))
         goto err;
 
@@ -83,8 +83,10 @@ static int do_bio_comp(const BIO_METHOD *meth, int n)
     int size = sizes[n % 4];
     int type = n / 4;
 
-    if (!TEST_ptr(original = OPENSSL_malloc(BUFFER_SIZE))
-        || !TEST_ptr(result = OPENSSL_malloc(BUFFER_SIZE)))
+    original = OPENSSL_malloc(BUFFER_SIZE);
+    result = OPENSSL_malloc(BUFFER_SIZE);
+
+    if (!TEST_ptr(original) || !TEST_ptr(result))
         goto err;
 
     switch (type) {

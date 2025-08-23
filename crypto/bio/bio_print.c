@@ -103,7 +103,8 @@ _dopr(char **sbuffer,
     size_t currlen;
 
     state = DP_S_DEFAULT;
-    flags = currlen = cflags = min = 0;
+    currlen = 0;
+    flags = cflags = min = 0;
     max = -1;
     ch = *format++;
 
@@ -316,10 +317,10 @@ _dopr(char **sbuffer,
             case 's':
                 strvalue = va_arg(args, char *);
                 if (max < 0) {
-                    if (buffer)
+                    if (buffer || *maxlen > INT_MAX)
                         max = INT_MAX;
                     else
-                        max = *maxlen;
+                        max = (int)*maxlen;
                 }
                 if (!fmtstr(sbuffer, buffer, &currlen, maxlen, strvalue,
                             flags, min, max))
@@ -334,8 +335,9 @@ _dopr(char **sbuffer,
             case 'n':
                 {
                     int *num;
+
                     num = va_arg(args, int *);
-                    *num = currlen;
+                    *num = (int)currlen;
                 }
                 break;
             case '%':
@@ -391,7 +393,7 @@ fmtstr(char **sbuffer,
 
     strln = OPENSSL_strnlen(value, max < 0 ? SIZE_MAX : (size_t)max);
 
-    padlen = min - strln;
+    padlen = (int)(min - strln);
     if (min < 0 || padlen < 0)
         padlen = 0;
     if (max >= 0) {
@@ -474,7 +476,7 @@ fmtint(char **sbuffer,
 
     zpadlen = max - place;
     spadlen =
-        min - OSSL_MAX(max, place) - (signvalue ? 1 : 0) - strlen(prefix);
+        min - OSSL_MAX(max, place) - (signvalue ? 1 : 0) - (int)strlen(prefix);
     if (zpadlen < 0)
         zpadlen = 0;
     if (spadlen < 0)
@@ -535,6 +537,10 @@ static LDOUBLE abs_val(LDOUBLE value)
     LDOUBLE result = value;
     if (value < 0)
         result = -value;
+    if (result > 0 && result / 2 == result) /* INF */
+        result = 0;
+    else if (result != result) /* NAN */
+        result = 0;
     return result;
 }
 
@@ -590,6 +596,9 @@ fmtfp(char **sbuffer,
         signvalue = '+';
     else if (flags & DP_F_SPACE)
         signvalue = ' ';
+    ufvalue = abs_val(fvalue);
+    if (ufvalue == 0 && fvalue != 0) /* INF or NAN? */
+        signvalue = '?';
 
     /*
      * G_FORMAT sometimes prints like E_FORMAT and sometimes like F_FORMAT
@@ -597,12 +606,12 @@ fmtfp(char **sbuffer,
      * that from here on.
      */
     if (style == G_FORMAT) {
-        if (fvalue == 0.0) {
+        if (ufvalue == 0.0) {
             realstyle = F_FORMAT;
-        } else if (fvalue < 0.0001) {
+        } else if (ufvalue < 0.0001) {
             realstyle = E_FORMAT;
-        } else if ((max == 0 && fvalue >= 10)
-                    || (max > 0 && fvalue >= pow_10(max))) {
+        } else if ((max == 0 && ufvalue >= 10)
+                   || (max > 0 && ufvalue >= pow_10(max))) {
             realstyle = E_FORMAT;
         } else {
             realstyle = F_FORMAT;
@@ -612,9 +621,9 @@ fmtfp(char **sbuffer,
     }
 
     if (style != F_FORMAT) {
-        tmpvalue = fvalue;
+        tmpvalue = ufvalue;
         /* Calculate the exponent */
-        if (fvalue != 0.0) {
+        if (ufvalue != 0.0) {
             while (tmpvalue < 1) {
                 tmpvalue *= 10;
                 exp--;
@@ -651,9 +660,9 @@ fmtfp(char **sbuffer,
             }
         }
         if (realstyle == E_FORMAT)
-            fvalue = tmpvalue;
+            ufvalue = tmpvalue;
     }
-    ufvalue = abs_val(fvalue);
+
     /*
      * By subtracting 65535 (2^16-1) we cancel the low order 15 bits
      * of ULONG_MAX to avoid using imprecise floating point values.

@@ -1,5 +1,5 @@
 /*
- * Copyright 2002-2023 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2002-2025 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -160,7 +160,7 @@ static ASN1_TYPE *generate_v3(const char *str, X509V3_CTX *cnf, int depth,
         if (r & 0x80)
             goto err;
         /* Update copy length */
-        cpy_len -= cpy_start - orig_der;
+        cpy_len -= (int)(cpy_start - orig_der);
         /*
          * For IMPLICIT tagging the length should match the original length
          * and constructed flag should be consistent.
@@ -255,8 +255,8 @@ static int asn1_cb(const char *elem, int len, void *bitstr)
         /* Look for the ':' in name value pairs */
         if (*p == ':') {
             vstart = p + 1;
-            vlen = len - (vstart - elem);
-            len = p - elem;
+            vlen = len - (int)(vstart - elem);
+            len = (int)(p - elem);
             break;
         }
     }
@@ -362,7 +362,7 @@ static int parse_tagging(const char *vstart, int vlen, int *ptag, int *pclass)
     *ptag = tag_num;
     /* If we have non numeric characters, parse them */
     if (eptr)
-        vlen -= eptr - vstart;
+        vlen -= (int)(eptr - vstart);
     else
         vlen = 0;
     if (vlen) {
@@ -499,7 +499,8 @@ static int append_exp(tag_exp_arg *arg, int exp_tag, int exp_class,
 static int asn1_str2tag(const char *tagstr, int len)
 {
     unsigned int i;
-    static const struct tag_name_st *tntmp, tnst[] = {
+    const struct tag_name_st *tntmp;
+    static const struct tag_name_st tnst[] = {
         ASN1_GEN_STR("BOOL", V_ASN1_BOOLEAN),
         ASN1_GEN_STR("BOOLEAN", V_ASN1_BOOLEAN),
         ASN1_GEN_STR("NULL", V_ASN1_NULL),
@@ -561,7 +562,7 @@ static int asn1_str2tag(const char *tagstr, int len)
     };
 
     if (len == -1)
-        len = strlen(tagstr);
+        len = (int)strlen(tagstr);
 
     tntmp = tnst;
     for (i = 0; i < OSSL_NELEM(tnst); i++, tntmp++) {

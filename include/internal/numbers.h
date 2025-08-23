@@ -19,7 +19,7 @@
 #  define __MAXINT__(T) ((T) ((((T) 1) << ((sizeof(T) * CHAR_BIT) - 1)) ^ __MAXUINT__(T)))
 #  define __MININT__(T) (-__MAXINT__(T) - 1)
 
-# elif (-1 & 3) == 0x02         /* One's complement */
+# elif (-1 & 3) == 0x02         /* Ones' complement */
 
 #  define __MAXUINT__(T) (((T) -1) + 1)
 #  define __MAXINT__(T) ((T) ((((T) 1) << ((sizeof(T) * CHAR_BIT) - 1)) ^ __MAXUINT__(T)))
@@ -104,6 +104,14 @@ typedef __uint128_t uint128_t;
 #  define OSSL_INTMAX_MIN __MININT__(ossl_intmax_t)
 #  define OSSL_INTMAX_MAX __MAXINT__(ossl_intmax_t)
 #  define OSSL_UINTMAX_MAX __MAXUINT__(ossl_uintmax_t)
+# endif
+
+/* Fix for cross compiling 64-bit PowerPC on OS X 10.4 */
+# if defined(__APPLE__) && defined(_ARCH_PPC64)
+#  ifdef SIZE_MAX
+#   undef SIZE_MAX
+#  endif
+#  define SIZE_MAX __MAXUINT__(uint64_t)
 # endif
 
 #endif

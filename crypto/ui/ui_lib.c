@@ -205,6 +205,7 @@ int UI_dup_input_string(UI *ui, const char *prompt, int flags,
                         char *result_buf, int minsize, int maxsize)
 {
     char *prompt_copy = NULL;
+    int ret;
 
     if (prompt != NULL) {
         prompt_copy = OPENSSL_strdup(prompt);
@@ -212,9 +213,13 @@ int UI_dup_input_string(UI *ui, const char *prompt, int flags,
             return 0;
     }
 
-    return general_allocate_string(ui, prompt_copy, 1,
-                                   UIT_PROMPT, flags, result_buf, minsize,
-                                   maxsize, NULL);
+    ret = general_allocate_string(ui, prompt_copy, 1,
+                                  UIT_PROMPT, flags, result_buf, minsize,
+                                  maxsize, NULL);
+    if (ret <= 0)
+        OPENSSL_free(prompt_copy);
+
+    return ret;
 }
 
 int UI_add_verify_string(UI *ui, const char *prompt, int flags,
@@ -231,6 +236,7 @@ int UI_dup_verify_string(UI *ui, const char *prompt, int flags,
                          const char *test_buf)
 {
     char *prompt_copy = NULL;
+    int ret;
 
     if (prompt != NULL) {
         prompt_copy = OPENSSL_strdup(prompt);
@@ -238,9 +244,12 @@ int UI_dup_verify_string(UI *ui, const char *prompt, int flags,
             return -1;
     }
 
-    return general_allocate_string(ui, prompt_copy, 1,
-                                   UIT_VERIFY, flags, result_buf, minsize,
-                                   maxsize, test_buf);
+    ret = general_allocate_string(ui, prompt_copy, 1,
+                                  UIT_VERIFY, flags, result_buf, minsize,
+                                  maxsize, test_buf);
+    if (ret <= 0)
+        OPENSSL_free(prompt_copy);
+    return ret;
 }
 
 int UI_add_input_boolean(UI *ui, const char *prompt, const char *action_desc,
@@ -260,6 +269,7 @@ int UI_dup_input_boolean(UI *ui, const char *prompt, const char *action_desc,
     char *action_desc_copy = NULL;
     char *ok_chars_copy = NULL;
     char *cancel_chars_copy = NULL;
+    int ret;
 
     if (prompt != NULL) {
         prompt_copy = OPENSSL_strdup(prompt);
@@ -285,9 +295,14 @@ int UI_dup_input_boolean(UI *ui, const char *prompt, const char *action_desc,
             goto err;
     }
 
-    return general_allocate_boolean(ui, prompt_copy, action_desc_copy,
-                                    ok_chars_copy, cancel_chars_copy, 1,
-                                    UIT_BOOLEAN, flags, result_buf);
+    ret = general_allocate_boolean(ui, prompt_copy, action_desc_copy,
+                                   ok_chars_copy, cancel_chars_copy, 1,
+                                   UIT_BOOLEAN, flags, result_buf);
+    if (ret <= 0)
+        goto err;
+
+    return ret;
+
  err:
     OPENSSL_free(prompt_copy);
     OPENSSL_free(action_desc_copy);
@@ -305,6 +320,7 @@ int UI_add_info_string(UI *ui, const char *text)
 int UI_dup_info_string(UI *ui, const char *text)
 {
     char *text_copy = NULL;
+    int ret;
 
     if (text != NULL) {
         text_copy = OPENSSL_strdup(text);
@@ -312,8 +328,11 @@ int UI_dup_info_string(UI *ui, const char *text)
             return -1;
     }
 
-    return general_allocate_string(ui, text_copy, 1, UIT_INFO, 0, NULL,
-                                   0, 0, NULL);
+    ret = general_allocate_string(ui, text_copy, 1, UIT_INFO, 0, NULL,
+                                  0, 0, NULL);
+    if (ret <= 0)
+        OPENSSL_free(text_copy);
+    return ret;
 }
 
 int UI_add_error_string(UI *ui, const char *text)
@@ -325,14 +344,19 @@ int UI_add_error_string(UI *ui, const char *text)
 int UI_dup_error_string(UI *ui, const char *text)
 {
     char *text_copy = NULL;
+    int ret;
 
     if (text != NULL) {
         text_copy = OPENSSL_strdup(text);
         if (text_copy == NULL)
             return -1;
     }
-    return general_allocate_string(ui, text_copy, 1, UIT_ERROR, 0, NULL,
-                                   0, 0, NULL);
+
+    ret = general_allocate_string(ui, text_copy, 1, UIT_ERROR, 0, NULL,
+                                  0, 0, NULL);
+    if (ret <= 0)
+        OPENSSL_free(text_copy);
+    return ret;
 }
 
 char *UI_construct_prompt(UI *ui, const char *phrase_desc,
@@ -350,9 +374,9 @@ char *UI_construct_prompt(UI *ui, const char *phrase_desc,
 
         if (phrase_desc == NULL)
             return NULL;
-        len = sizeof(prompt1) - 1 + strlen(phrase_desc);
+        len = sizeof(prompt1) - 1 + (int)strlen(phrase_desc);
         if (object_name != NULL)
-            len += sizeof(prompt2) - 1 + strlen(object_name);
+            len += sizeof(prompt2) - 1 + (int)strlen(object_name);
         len += sizeof(prompt3) - 1;
 
         if ((prompt = OPENSSL_malloc(len + 1)) == NULL)
@@ -803,7 +827,7 @@ int UI_get_result_string_length(UI_STRING *uis)
     switch (uis->type) {
     case UIT_PROMPT:
     case UIT_VERIFY:
-        return uis->result_len;
+        return (int)uis->result_len;
     case UIT_NONE:
     case UIT_BOOLEAN:
     case UIT_INFO:
@@ -860,7 +884,7 @@ int UI_get_result_maxsize(UI_STRING *uis)
 
 int UI_set_result(UI *ui, UI_STRING *uis, const char *result)
 {
-    return UI_set_result_ex(ui, uis, result, strlen(result));
+    return UI_set_result_ex(ui, uis, result, (int)strlen(result));
 }
 
 int UI_set_result_ex(UI *ui, UI_STRING *uis, const char *result, int len)

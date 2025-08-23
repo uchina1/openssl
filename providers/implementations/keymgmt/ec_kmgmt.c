@@ -1,5 +1,5 @@
 /*
- * Copyright 2020-2024 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2020-2025 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -20,12 +20,14 @@
 #include <openssl/err.h>
 #include <openssl/objects.h>
 #include <openssl/proverr.h>
+#include <openssl/self_test.h>
 #include "crypto/bn.h"
 #include "crypto/ec.h"
 #include "prov/implementations.h"
 #include "prov/providercommon.h"
 #include "prov/provider_ctx.h"
 #include "prov/securitycheck.h"
+#include "internal/fips.h"
 #include "internal/param_build_set.h"
 
 #ifndef FIPS_MODULE
@@ -429,6 +431,21 @@ int common_import(void *keydata, int selection, const OSSL_PARAM params[],
     if ((selection & OSSL_KEYMGMT_SELECT_OTHER_PARAMETERS) != 0)
         ok = ok && ossl_ec_key_otherparams_fromdata(ec, params);
 
+#ifdef FIPS_MODULE
+    if (ok > 0
+            && !ossl_fips_self_testing()
+            && EC_KEY_get0_public_key(ec) != NULL
+            && EC_KEY_get0_private_key(ec) != NULL
+            && EC_KEY_get0_group(ec) != NULL) {
+        BN_CTX *bnctx = BN_CTX_new_ex(ossl_ec_key_get_libctx(ec));
+
+        ok = bnctx != NULL && ossl_ec_key_pairwise_check(ec, bnctx);
+        BN_CTX_free(bnctx);
+        if (ok <= 0)
+            ossl_set_error_state(OSSL_SELF_TEST_TYPE_PCT);
+    }
+#endif  /* FIPS_MODULE */
+
     return ok;
 }
 
@@ -704,6 +721,9 @@ int common_get_params(void *key, OSSL_PARAM params[], int sm2)
         if (!OSSL_PARAM_set_int(p, sec_bits))
             goto err;
     }
+    if ((p = OSSL_PARAM_locate(params, OSSL_PKEY_PARAM_SECURITY_CATEGORY)) != NULL)
+        if (!OSSL_PARAM_set_int(p, 0))
+            goto err;
 
     if ((p = OSSL_PARAM_locate(params,
                                OSSL_PKEY_PARAM_EC_DECODED_FROM_EXPLICIT_PARAMS))
@@ -788,6 +808,7 @@ static const OSSL_PARAM ec_known_gettable_params[] = {
     OSSL_PARAM_int(OSSL_PKEY_PARAM_BITS, NULL),
     OSSL_PARAM_int(OSSL_PKEY_PARAM_SECURITY_BITS, NULL),
     OSSL_PARAM_int(OSSL_PKEY_PARAM_MAX_SIZE, NULL),
+    OSSL_PARAM_int(OSSL_PKEY_PARAM_SECURITY_CATEGORY, NULL),
     OSSL_PARAM_utf8_string(OSSL_PKEY_PARAM_DEFAULT_DIGEST, NULL, 0),
     OSSL_PARAM_octet_string(OSSL_PKEY_PARAM_ENCODED_PUBLIC_KEY, NULL, 0),
     OSSL_PARAM_int(OSSL_PKEY_PARAM_EC_DECODED_FROM_EXPLICIT_PARAMS, NULL),
@@ -1107,7 +1128,6 @@ static int ec_gen_set_params(void *genctx, const OSSL_PARAM params[])
     int ret = 0;
     struct ec_gen_ctx *gctx = genctx;
     const OSSL_PARAM *p;
-    EC_GROUP *group = NULL;
 
     if (!OSSL_FIPS_IND_SET_CTX_PARAM(gctx, OSSL_FIPS_IND_SETTABLE0, params,
                                      OSSL_PKEY_PARAM_FIPS_KEY_CHECK))
@@ -1136,7 +1156,6 @@ static int ec_gen_set_params(void *genctx, const OSSL_PARAM params[])
 
     ret = 1;
 err:
-    EC_GROUP_free(group);
     return ret;
 }
 
@@ -1306,14 +1325,10 @@ static void *ec_gen(void *genctx, OSSL_CALLBACK *osslcb, void *cbarg)
         }
     }
 #ifdef FIPS_MODULE
-    if (!ossl_ec_check_security_strength(gctx->gen_group, 1)) {
-        if (!OSSL_FIPS_IND_ON_UNAPPROVED(gctx, OSSL_FIPS_IND_SETTABLE0,
-                                         gctx->libctx, "EC KeyGen", "key size",
-                                         ossl_fips_config_securitycheck_enabled)) {
-            ERR_raise(ERR_LIB_PROV, PROV_R_INVALID_KEY_LENGTH);
-            goto err;
-        }
-    }
+    if (!ossl_fips_ind_ec_key_check(OSSL_FIPS_IND_GET(gctx),
+                                    OSSL_FIPS_IND_SETTABLE0, gctx->libctx,
+                                    gctx->gen_group, "EC KeyGen", 1))
+        goto err;
 #endif
 
     /* We must always assign a group, no matter what */

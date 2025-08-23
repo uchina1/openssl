@@ -65,7 +65,7 @@ static long bio_call_callback(BIO *b, int oper, const char *argp, size_t len,
     if (inret > 0 && (oper & BIO_CB_RETURN) && bareoper != BIO_CB_CTRL) {
         if (*processed > INT_MAX)
             return -1;
-        inret = *processed;
+        inret = (long)*processed;
     }
 
     ret = b->callback(b, oper, argp, argi, argl, inret);
@@ -126,7 +126,7 @@ int BIO_free(BIO *a)
     if (CRYPTO_DOWN_REF(&a->references, &ret) <= 0)
         return 0;
 
-    REF_PRINT_COUNT("BIO", a);
+    REF_PRINT_COUNT("BIO", ret, a);
     if (ret > 0)
         return 1;
     REF_ASSERT_ISNT(ret < 0);
@@ -191,7 +191,7 @@ int BIO_up_ref(BIO *a)
     if (CRYPTO_UP_REF(&a->references, &i) <= 0)
         return 0;
 
-    REF_PRINT_COUNT("BIO", a);
+    REF_PRINT_COUNT("BIO", i, a);
     REF_ASSERT_ISNT(i < 2);
     return i > 1;
 }
@@ -433,9 +433,9 @@ int BIO_sendmmsg(BIO *b, BIO_MSG *msg,
 
     if (HAS_CALLBACK(b))
         ret = (size_t)bio_call_callback(b, BIO_CB_SENDMMSG | BIO_CB_RETURN,
-                                        (void *)&args, ret, 0, 0, ret, NULL);
+                                        (void *)&args, ret, 0, 0, (long)ret, NULL);
 
-    return ret;
+    return ret > 0;
 }
 
 int BIO_recvmmsg(BIO *b, BIO_MSG *msg,
@@ -480,9 +480,9 @@ int BIO_recvmmsg(BIO *b, BIO_MSG *msg,
 
     if (HAS_CALLBACK(b))
         ret = (size_t)bio_call_callback(b, BIO_CB_RECVMMSG | BIO_CB_RETURN,
-                                        (void *)&args, ret, 0, 0, ret, NULL);
+                                        (void *)&args, ret, 0, 0, (long)ret, NULL);
 
-    return ret;
+    return ret > 0;
 }
 
 int BIO_get_rpoll_descriptor(BIO *b, BIO_POLL_DESCRIPTOR *desc)
@@ -624,7 +624,7 @@ int BIO_get_line(BIO *bio, char *buf, int size)
         if (*ptr++ == '\n')
             break;
     *ptr = '\0';
-    return ret > 0 || BIO_eof(bio) ? ptr - buf : ret;
+    return ret > 0 || BIO_eof(bio) ? (int)(ptr - buf) : ret;
 }
 
 int BIO_indent(BIO *b, int indent, int max)
@@ -1080,3 +1080,18 @@ int BIO_do_connect_retry(BIO *bio, int timeout, int nap_milliseconds)
 
     return rv;
 }
+
+#ifndef OPENSSL_NO_SOCK
+
+int BIO_err_is_non_fatal(unsigned int errcode)
+{
+    if (ERR_SYSTEM_ERROR(errcode))
+        return BIO_sock_non_fatal_error(ERR_GET_REASON(errcode));
+    else if (ERR_GET_LIB(errcode) == ERR_LIB_BIO
+             && ERR_GET_REASON(errcode) == BIO_R_NON_FATAL)
+        return 1;
+    else
+        return 0;
+}
+
+#endif

@@ -1,5 +1,5 @@
 /*
- * Copyright 2022-2023 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2022-2025 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -164,7 +164,7 @@ err:
     return ret;
 }
 
-/* Fail if the operation parameter is not set */
+/* Succeed even if the operation parameter is not set */
 static int test_no_operation_set(int tstid)
 {
     EVP_PKEY_CTX *ctx = rctx[tstid];
@@ -172,11 +172,11 @@ static int test_no_operation_set(int tstid)
     size_t len = 0;
 
     return TEST_int_eq(EVP_PKEY_encapsulate_init(ctx, NULL), 1)
-           && TEST_int_eq(EVP_PKEY_encapsulate(ctx, NULL, &len, NULL, NULL), -2)
+           && TEST_int_eq(EVP_PKEY_encapsulate(ctx, NULL, &len, NULL, NULL), 1)
            && TEST_int_eq(EVP_PKEY_decapsulate_init(ctx, NULL), 1)
            && TEST_int_eq(EVP_PKEY_decapsulate(ctx, NULL, &len,
                                                t->expected_enc,
-                                               t->expected_enclen), -2);
+                                               t->expected_enclen), 1);
 }
 
 /* Fail if the ikm is too small */
@@ -471,7 +471,8 @@ static int test_ec_dhkem_derivekey(int tstid)
     const TEST_DERIVEKEY_DATA *t = &ec_derivekey_data[tstid];
     unsigned char pubkey[133];
     unsigned char privkey[66];
-    size_t pubkeylen = 0, privkeylen = 0;
+    size_t pubkeylen = 0;
+    int privkeylen = 0;
     BIGNUM *priv = NULL;
 
     params[0] = OSSL_PARAM_construct_utf8_string(OSSL_PKEY_PARAM_GROUP_NAME,

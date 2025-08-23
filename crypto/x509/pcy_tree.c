@@ -1,5 +1,5 @@
 /*
- * Copyright 2004-2024 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2004-2025 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -186,7 +186,7 @@ static int tree_init(X509_POLICY_TREE **ptree, STACK_OF(X509) *certs,
      * policies of anyPolicy.  (RFC 5280 has the TA at depth 0 and the leaf at
      * depth n, we have the leaf at depth 0 and the TA at depth n).
      */
-    if ((tree->levels = OPENSSL_zalloc(sizeof(*tree->levels)*(n+1))) == NULL) {
+    if ((tree->levels = OPENSSL_calloc(n + 1, sizeof(*tree->levels))) == NULL) {
         OPENSSL_free(tree);
         return X509_PCY_TREE_INTERNAL;
     }
@@ -211,7 +211,9 @@ static int tree_init(X509_POLICY_TREE **ptree, STACK_OF(X509) *certs,
         /* Access the cache which we now know exists */
         cache = ossl_policy_cache_set(x);
 
-        X509_up_ref(x);
+        if (!X509_up_ref(x))
+            goto bad_tree;
+
         (++level)->cert = x;
 
         if (!cache->anyPolicy)

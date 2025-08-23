@@ -1,5 +1,5 @@
 /*
- * Copyright 2016-2023 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2016-2025 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -23,7 +23,12 @@
 # include "crypto/rand_pool.h"
 
 # if defined(__APPLE__) && !defined(OPENSSL_NO_APPLE_CRYPTO_RANDOM)
-#  include <Availability.h>
+#  if defined(__MAC_OS_X_VERSION_MIN_REQUIRED) && __MAC_OS_X_VERSION_MIN_REQUIRED >= 1050
+#   include <Availability.h>
+#  else
+#   include <TargetConditionals.h>
+#   include <AvailabilityMacros.h>
+#  endif
 #  if (defined(__MAC_OS_X_VERSION_MIN_REQUIRED) && __MAC_OS_X_VERSION_MIN_REQUIRED >= 101200) || \
      (defined(__IPHONE_OS_VERSION_MIN_REQUIRED) && __IPHONE_OS_VERSION_MIN_REQUIRED >= 80000)
 #   define OPENSSL_APPLE_CRYPTO_RANDOM 1
@@ -150,5 +155,16 @@ uint32_t ossl_rand_uniform_uint32(OSSL_LIB_CTX *ctx, uint32_t upper, int *err);
  */
 uint32_t ossl_rand_range_uint32(OSSL_LIB_CTX *ctx, uint32_t lower, uint32_t upper,
                                 int *err);
+
+/*
+ * Check if the named provider is the nominated entropy/random provider.
+ * If it is, use it.
+ */
+# ifndef FIPS_MODULE
+int ossl_rand_check_random_provider_on_load(OSSL_LIB_CTX *ctx,
+                                            OSSL_PROVIDER *prov);
+int ossl_rand_check_random_provider_on_unload(OSSL_LIB_CTX *ctx,
+                                              OSSL_PROVIDER *prov);
+# endif     /* FIPS_MODULE */
 
 #endif

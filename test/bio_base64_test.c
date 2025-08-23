@@ -1,5 +1,5 @@
 /*
- * Copyright 2024 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2024-2025 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -100,7 +100,7 @@ static int encode(unsigned const char *buf, unsigned buflen, char *encoded,
 
     /* Use a verbatim encoding when provided */
     if (encoded != NULL) {
-        int elen = strlen(encoded);
+        int elen = (int)strlen(encoded);
 
         return BIO_write(mem, encoded, elen) == elen;
     }
@@ -152,8 +152,8 @@ static int genb64(char *prefix, char *suffix, unsigned const char *buf,
                   unsigned buflen, int trunc, char *encoded, unsigned llen,
                   unsigned wscnt, char **out)
 {
-    int preflen = strlen(prefix);
-    int sufflen = strlen(suffix);
+    int preflen = (int)strlen(prefix);
+    int sufflen = (int)strlen(suffix);
     int outlen;
     char newline = '\n';
     BUF_MEM *bptr;
@@ -174,7 +174,7 @@ static int genb64(char *prefix, char *suffix, unsigned const char *buf,
     /* Orphan the memory BIO's data buffer */
     BIO_get_mem_ptr(mem, &bptr);
     *out = bptr->data;
-    outlen = bptr->length;
+    outlen = (int)bptr->length;
     bptr->data = NULL;
     (void) BIO_set_close(mem, BIO_NOCLOSE);
     BIO_free(mem);
@@ -457,7 +457,7 @@ int setup_tests(void)
      *
      * Followed by zero, one or two additional bytes that may involve padding,
      * or else (truncation) 1, 2 or 3 bytes with missing padding.
-     * Only the the first four variants make sense with padding or truncated
+     * Only the first four variants make sense with padding or truncated
      * groups.
      *
      * With two types of underlying BIO

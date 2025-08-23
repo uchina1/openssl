@@ -1,5 +1,5 @@
 /*
- * Copyright 1995-2024 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 1995-2025 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -105,6 +105,10 @@ int verify_callback(int ok, X509_STORE_CTX *ctx)
     case X509_V_ERR_NO_EXPLICIT_POLICY:
         if (!verify_args.quiet)
             policies_print(ctx);
+        break;
+    case X509_V_ERR_OCSP_NO_RESPONSE:
+        if (!verify_args.quiet)
+            BIO_printf(bio_err, "no OCSP response(s) for certificate(s) found.\n");
         break;
     }
     if (err == X509_V_OK && ok == 2 && !verify_args.quiet)
@@ -328,6 +332,7 @@ static int do_print_sigalgs(BIO *out, SSL *s, int shared)
 
 int ssl_print_sigalgs(BIO *out, SSL *s)
 {
+    const char *name;
     int nid;
 
     if (!SSL_is_server(s))
@@ -336,7 +341,9 @@ int ssl_print_sigalgs(BIO *out, SSL *s)
     do_print_sigalgs(out, s, 1);
     if (SSL_get_peer_signature_nid(s, &nid) && nid != NID_undef)
         BIO_printf(out, "Peer signing digest: %s\n", OBJ_nid2sn(nid));
-    if (SSL_get_peer_signature_type_nid(s, &nid))
+    if (SSL_get0_peer_signature_name(s, &name))
+        BIO_printf(out, "Peer signature type: %s\n", name);
+    else if (SSL_get_peer_signature_type_nid(s, &nid))
         BIO_printf(out, "Peer signature type: %s\n", get_sigtype(nid));
     return 1;
 }
@@ -416,6 +423,7 @@ int ssl_print_groups(BIO *out, SSL *s, int noshared)
 
 int ssl_print_tmp_key(BIO *out, SSL *s)
 {
+    const char *keyname;
     EVP_PKEY *key;
 
     if (!SSL_get_peer_tmp_key(s, &key)) {
@@ -425,10 +433,16 @@ int ssl_print_tmp_key(BIO *out, SSL *s)
         return 1;
     }
 
-    BIO_puts(out, "Server Temp Key: ");
+    BIO_puts(out, "Peer Temp Key: ");
     switch (EVP_PKEY_get_id(key)) {
     case EVP_PKEY_RSA:
         BIO_printf(out, "RSA, %d bits\n", EVP_PKEY_get_bits(key));
+        break;
+
+    case EVP_PKEY_KEYMGMT:
+        if ((keyname = EVP_PKEY_get0_type_name(key)) == NULL)
+            keyname = "?";
+        BIO_printf(out, "%s\n", keyname);
         break;
 
     case EVP_PKEY_DH:
@@ -499,7 +513,8 @@ long bio_dump_callback(BIO *bio, int cmd, const char *argp, size_t len,
                 BIO_printf(out, "read from %p [%p] (%zu bytes => %zu (0x%zX))\n",
                            (void *)bio, (void *)msg->data, msg->data_len,
                            msg->data_len, msg->data_len);
-                BIO_dump(out, msg->data, msg->data_len);
+                if (msg->data_len <= INT_MAX)
+                    BIO_dump(out, msg->data, (int)msg->data_len);
             }
         } else if (mmsgargs->num_msg > 0) {
             BIO_MSG *msg = mmsgargs->msg;
@@ -519,7 +534,8 @@ long bio_dump_callback(BIO *bio, int cmd, const char *argp, size_t len,
                 BIO_printf(out, "write to %p [%p] (%zu bytes => %zu (0x%zX))\n",
                            (void *)bio, (void *)msg->data, msg->data_len,
                            msg->data_len, msg->data_len);
-                BIO_dump(out, msg->data, msg->data_len);
+                if (msg->data_len <= INT_MAX)
+                    BIO_dump(out, msg->data, (int)msg->data_len);
             }
         } else if (mmsgargs->num_msg > 0) {
             BIO_MSG *msg = mmsgargs->msg;
@@ -1299,6 +1315,7 @@ void print_verify_detail(SSL *s, BIO *bio)
 
 void print_ssl_summary(SSL *s)
 {
+    const char *sigalg;
     const SSL_CIPHER *c;
     X509 *peer = SSL_get0_peer_certificate(s);
     EVP_PKEY *peer_rpk = SSL_get0_peer_rpk(s);
@@ -1316,13 +1333,13 @@ void print_ssl_summary(SSL *s)
         BIO_puts(bio_err, "\n");
         if (SSL_get_peer_signature_nid(s, &nid))
             BIO_printf(bio_err, "Hash used: %s\n", OBJ_nid2sn(nid));
-        if (SSL_get_peer_signature_type_nid(s, &nid))
-            BIO_printf(bio_err, "Signature type: %s\n", get_sigtype(nid));
+        if (SSL_get0_peer_signature_name(s, &sigalg))
+            BIO_printf(bio_err, "Signature type: %s\n", sigalg);
         print_verify_detail(s, bio_err);
     } else if (peer_rpk != NULL) {
         BIO_printf(bio_err, "Peer used raw public key\n");
-        if (SSL_get_peer_signature_type_nid(s, &nid))
-            BIO_printf(bio_err, "Signature type: %s\n", get_sigtype(nid));
+        if (SSL_get0_peer_signature_name(s, &sigalg))
+            BIO_printf(bio_err, "Signature type: %s\n", sigalg);
         print_verify_detail(s, bio_err);
     } else {
         BIO_puts(bio_err, "No peer certificate or raw public key\n");
@@ -1332,8 +1349,7 @@ void print_ssl_summary(SSL *s)
     if (SSL_is_server(s))
         ssl_print_groups(bio_err, s, 1);
 #endif
-    if (!SSL_is_server(s))
-        ssl_print_tmp_key(bio_err, s);
+    ssl_print_tmp_key(bio_err, s);
 }
 
 int config_ctx(SSL_CONF_CTX *cctx, STACK_OF(OPENSSL_STRING) *str,
@@ -1535,12 +1551,9 @@ static int security_callback_debug(const SSL *s, const SSL_CTX *ctx,
                 if (pkey == NULL) {
                     BIO_printf(sdb->out, "Public key missing");
                 } else {
-                    const char *algname = "";
-
-                    EVP_PKEY_asn1_get0_info(NULL, NULL, NULL, NULL,
-                                            &algname, EVP_PKEY_get0_asn1(pkey));
                     BIO_printf(sdb->out, "%s, bits=%d",
-                            algname, EVP_PKEY_get_bits(pkey));
+                               EVP_PKEY_get0_type_name(pkey),
+                               EVP_PKEY_get_bits(pkey));
                 }
             }
             break;
