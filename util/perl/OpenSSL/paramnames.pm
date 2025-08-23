@@ -637,6 +637,16 @@ sub output_ifdef {
     }
 }
 
+sub output_else {
+    my $cond = shift;
+    my $body = shift;
+
+    if (defined($cond)) {
+        print "# else\n";
+        print($body);
+    }
+}
+
 sub output_endifdef {
     my $cond = shift;
 
@@ -713,8 +723,15 @@ sub generate_decoder_from_trie {
                 if ($suf ne $trieref->{'suffix'});
         }
         print ")) {\n";
+        printf "%s/* %s */\n", $indent1, $trieref->{'name'};
         trie_matched($field, $num, $indent1, $indent2);
         printf "%s}\n", $indent0;
+
+        # If this is at the top level and it's conditional, we have to
+        # insert an empty statement in an else branch to avoid badness.
+        # This isn't a problem at any other level since those are always
+        # followed by a break statement.
+        output_else($ifdefs->{$field}, $indent0 . ";\n") if ($n == 0);
         output_endifdef($ifdefs->{$field});
         return;
     }
@@ -727,8 +744,8 @@ sub generate_decoder_from_trie {
             $field = $identmap->{$trieref->{'val'}};
             my $num = $concat_num->{$field};
             printf "%sbreak;\n", $indent1;
-            output_ifdef($ifdefs->{$field});
             printf "%scase '\\0':\n", $indent0;
+            output_ifdef($ifdefs->{$field});
             trie_matched($field, $num, $indent1, $indent2);
             output_endifdef($ifdefs->{$field});
         } else {
@@ -837,17 +854,20 @@ sub output_param_decoder {
             } elsif ($pnum eq 'fips') {
                 # The `#if' is added on output
                 $ifdefs{$pident} = ' defined(FIPS_MODULE)';
+            } elsif ($pnum eq '!fips') {
+                $ifdefs{$pident} = ' !defined(FIPS_MODULE)';
             } elsif (substr($pnum, 0, 3) eq '#if') {
                 # Trim the `#if' from the front
                 $ifdefs{$pident} = substr($pnum, 3);
-            } else {
+            } elsif (not defined $concat_num{$pident}) {
                 $concat_num{$pident} = $pnum;
             }
         }
         output_ifdef($ifdefs{$pident});
         print "    OSSL_PARAM_$ptype(OSSL_$pname, NULL";
         print ", 0" if $ptype eq "octet_string" || $ptype eq "octet_ptr"
-                       || $ptype eq "utf8_string" || $ptype eq "utf8_ptr";
+                       || $ptype eq "utf8_string" || $ptype eq "utf8_ptr"
+                       || $ptype eq "BN";
         printf "),\n";
         output_endifdef($ifdefs{$pident});
     }
@@ -867,6 +887,11 @@ sub output_param_decoder {
             } else {
                 printf "    OSSL_PARAM *%s;\n", $pident;
             }
+
+            # If this is the only field and it's conditional, we have to
+            # insert a dummy field to avoid an empty struct
+            output_else($ifdefs{$pident}, "    int dummy; /* unused */\n")
+                if (keys(%prms) == 1);
             output_endifdef($ifdefs{$pident});
         }
     }

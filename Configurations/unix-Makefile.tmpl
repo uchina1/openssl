@@ -636,7 +636,7 @@ clean: libclean ## Clean the workspace, keep the configuration
 	$(RM) tags TAGS doc-nits md-nits
 	$(RM) -r test/test-runs
 	$(RM) providers/fips*.new
-	-find . -type l \! -name '.*' -exec $(RM) {} \;
+	-find . -type l \! -name '.*' \! -wholename './pkcs11-provider/*' -exec $(RM) {} \;
 
 distclean: clean ## Clean and remove the configuration
 	$(RM) include/openssl/configuration.h
@@ -1422,7 +1422,7 @@ test_ordinals:
 tags TAGS: FORCE build_generated
 	rm -f TAGS tags
 	-( cd $(SRCDIR); util/ctags.sh )
-	-etags `find . -name '*.[ch]' -o -name '*.pm'`
+	-etags `find . -name '*.[ch]' -o -name '*.pm' -o -name '*.inc'`
 
 providers/fips.checksum.new: providers/fips.module.sources.new
 	@which unifdef > /dev/null || \
